@@ -59,6 +59,7 @@ struct JBuf {
   const char *c_str() const { return p ? p : ""; }
 };
 
+static char ltResult[160] = "none yet";
 static JBuf JB;
 static SemaphoreHandle_t jbMux = nullptr;
 

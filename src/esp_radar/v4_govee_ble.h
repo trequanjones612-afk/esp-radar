@@ -20,9 +20,9 @@
 // H6008 writes are untested here. That issue also says the Wi-Fi bulb's command
 // bytes were not identical to a BLE-only strip, so power/brightness may need a tweak.
 //
-// Keep-alives: those clients write one packet and disconnect; the bulb keeps the
-// state. We do the same. A timer keep-alive would hold the radio and knock down
-// CSI, so one is sent only as part of an on/off/brightness command, never on a clock.
+// Keep-alive is only inside a command, never on a timer (a timer would hold the
+// radio and drop CSI). H6006/H6008 at a weak RSSI ignore a single power write.
+// The keep-alive frame used by Govee Homebridge sniffers is AA 01 00… checksum AB.
 //
 // Coexistence: BLE is inited on first use, then left idle (no scan, no connection).
 // A scan is 4 s at 30 ms window / 100 ms interval (~30% airtime) and only when asked.
@@ -165,19 +165,54 @@ static void goveePacket(uint8_t pkt[20], uint8_t cmd, uint8_t a, uint8_t b = 0) 
   for (int i = 0; i < 19; i++) x ^= pkt[i];
   pkt[19] = x;
 }
+// AA 01 00… XOR = AB. Sent only while this command's connection is up.
+static void goveeKeepalive(uint8_t pkt[20]) {
+  memset(pkt, 0, 20);
+  pkt[0] = 0xAA;
+  pkt[1] = 0x01;
+  uint8_t x = 0;
+  for (int i = 0; i < 19; i++) x ^= pkt[i];
+  pkt[19] = x;
+}
+// NimBLE: response=false is ble_gattc_write_no_rsp_flat. This characteristic is
+// write-without-response. If that returns false, try a write-with-response once.
+static bool goveeWritePkt(BLERemoteCharacteristic *ch, uint8_t pkt[20], bool &usedRsp) {
+  if (ch->writeValue(pkt, 20, false)) { usedRsp = false; return true; }
+  if (ch->writeValue(pkt, 20, true)) { usedRsp = true; return true; }
+  return false;
+}
 
 static bool goveeBleWrite(const char *mac, uint8_t addrType, bool on, int briPct) {
-  if (!mac || !mac[0] || !goveeBleStorage() || !goveeBleInit()) return false;
+  if (scanning) {
+    snprintf(ltResult, sizeof ltResult, "BLE not started: WiFi scan in progress");
+    return false;
+  }
+  if (!mac || !mac[0] || !goveeBleStorage() || !goveeBleInit()) {
+    snprintf(ltResult, sizeof ltResult, "BLE init failed");
+    return false;
+  }
   if (!goveeClient) goveeClient = BLEDevice::createClient();
-  if (!goveeClient) { goveeBleShutdown(); return false; }
+  if (!goveeClient) {
+    snprintf(ltResult, sizeof ltResult, "BLE no client");
+    goveeBleShutdown();
+    return false;
+  }
   if (goveeClient->isConnected()) goveeClient->disconnect();
-  BLEAddress addr(String(mac), addrType);
-  if (!goveeClient->connect(addr, addrType, 2500)) {
-    if (addrType != BLE_ADDR_PUBLIC || !goveeClient->connect(BLEAddress(String(mac), BLE_ADDR_RANDOM), BLE_ADDR_RANDOM, 2000)) {
-      Serial.printf("# govee BLE %s no connect\n", mac);
-      goveeBleShutdown();
-      return false;
-    }
+  bool connected = false;
+  for (int attempt = 0; attempt < 3 && !connected; attempt++) {
+    if (scanning) break;
+    BLEAddress pub(String(mac), addrType);
+    if (goveeClient->connect(pub, addrType, 8000)) connected = true;
+    else if (addrType == BLE_ADDR_PUBLIC &&
+             goveeClient->connect(BLEAddress(String(mac), BLE_ADDR_RANDOM), BLE_ADDR_RANDOM, 8000))
+      connected = true;
+    else vTaskDelay(pdMS_TO_TICKS(400));
+  }
+  if (!connected) {
+    snprintf(ltResult, sizeof ltResult, "BLE connect fail %s (3 tries, 8s)", mac);
+    Serial.printf("# %s\n", ltResult);
+    goveeBleShutdown();
+    return false;
   }
   BLERemoteCharacteristic *ch = nullptr;
   BLERemoteService *svc = goveeClient->getService(GOVEE_BLE_SVC);
@@ -191,22 +226,40 @@ static bool goveeBleWrite(const char *mac, uint8_t addrType, bool on, int briPct
       }
     }
   }
-  bool ok = false;
-  if (ch) {
-    uint8_t pkt[20];
-    goveePacket(pkt, 0x01, on ? 0x01 : 0x00);
-    ok = ch->writeValue(pkt, 20, false);
-    if (ok && on) {
-      int bri = constrain(briPct, 1, 100);
-      uint8_t level = (uint8_t)((bri * 255) / 100);
-      if (!level) level = 1;
-      vTaskDelay(pdMS_TO_TICKS(40));
-      goveePacket(pkt, 0x04, level);
-      ok = ch->writeValue(pkt, 20, false);
-    }
+  if (!ch) {
+    snprintf(ltResult, sizeof ltResult, "BLE connected %s, characteristic not found", mac);
+    Serial.printf("# %s\n", ltResult);
+    if (goveeClient->isConnected()) goveeClient->disconnect();
+    goveeBleShutdown();
+    return false;
   }
+  bool rsp = false, ok = false;
+  uint8_t pkt[20];
+  goveeKeepalive(pkt);
+  bool ka = goveeWritePkt(ch, pkt, rsp);
+  int powerOk = 0;
+  goveePacket(pkt, 0x01, on ? 0x01 : 0x00);
+  for (int n = 0; n < 3; n++) {
+    if (goveeWritePkt(ch, pkt, rsp)) powerOk++;
+    vTaskDelay(pdMS_TO_TICKS(80));
+  }
+  bool briOk = true;
+  if (on && powerOk) {
+    int bri = constrain(briPct, 1, 100);
+    uint8_t level = (uint8_t)((bri * 255) / 100);
+    if (!level) level = 1;
+    goveePacket(pkt, 0x04, level);
+    briOk = false;
+    for (int n = 0; n < 2; n++) if (goveeWritePkt(ch, pkt, rsp)) briOk = true;
+  }
+  goveeKeepalive(pkt);
+  goveeWritePkt(ch, pkt, rsp);
+  ok = powerOk > 0 && briOk;
   if (goveeClient->isConnected()) goveeClient->disconnect();
-  Serial.printf("# govee BLE %s %s bri=%d write=%s\n", mac, on ? "on" : "off", briPct, ok ? "ok" : "fail");
+  snprintf(ltResult, sizeof ltResult, "BLE %s connected, char ok, keep-alive %s, power %d/3 %s%s",
+           mac, ka ? "ok" : "fail", powerOk, rsp ? "with-response" : "no-response",
+           on ? (briOk ? ", brightness ok" : ", brightness fail") : "");
+  Serial.printf("# %s\n", ltResult);
   goveeBleShutdown();
   return ok;
 }

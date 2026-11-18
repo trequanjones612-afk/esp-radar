@@ -103,14 +103,41 @@ static int hFind(const uint8_t *mac) {
   for (int i = 0; i < hCount; i++) if (!memcmp(hdb[i].mac, mac, 6)) return i;
   return -1;
 }
+static bool devIsGw(int idx) {
+  if (!staUp || !devs || idx < 0 || idx >= devCount) return false;
+  IPAddress gw = WiFi.gatewayIP();
+  IPAddress me = WiFi.localIP();
+  return gw[3] && gw[0] == me[0] && gw[1] == me[1] && gw[2] == me[2] && devs[idx].ip4 == gw[3];
+}
+// Online means the LAN still sees it. A fresh ARP reply counts even while the
+// sniffer is running: the eero's LAN MAC is not the BSSID the radio hears, and
+// most phones are on 5 GHz. Radio is extra evidence, not a replacement.
+static bool devLanFresh(int idx, uint32_t now) {
+  if (!devs || idx < 0 || idx >= devCount) return false;
+  if (devs[idx].ip4 && devs[idx].ip4 == (staUp ? WiFi.localIP()[3] : 0)) return true;
+  if (devIsGw(idx)) return true;
+  if (devs[idx].last && (uint32_t)(now - devs[idx].last) < V4_ONLINE_MS) return true;
+  uint32_t heard = v4WatchMs(devs[idx].mac);
+  return heard && (uint32_t)(now - heard) < V4_ONLINE_MS;
+}
+static int devIndex(const uint8_t *mac);
+static bool macIsGw(const uint8_t *mac) {
+  int di = devIndex(mac);
+  return devIsGw(di);
+}
+
 static int hEnsure(const uint8_t *mac) {
   if (!hdb) return -1;
   int i = hFind(mac);
   if (i >= 0) return i;
   if (hCount >= HMAX) {
-    int drop = 0;
-    for (int k = 1; k < hCount; k++) if ((hdb[k].flags & HF_PERSON) == 0 && hdb[k].totMin < hdb[drop].totMin) drop = k;
-    if (hdb[drop].flags & HF_PERSON) return -1;
+    int drop = -1;
+    for (int k = 0; k < hCount; k++) {
+      if (hdb[k].flags & HF_PERSON) continue;
+      if (macIsGw(hdb[k].mac)) continue;
+      if (drop < 0 || hdb[k].totMin < hdb[drop].totMin) drop = k;
+    }
+    if (drop < 0) return -1;
     memset(&hdb[drop], 0, sizeof(HRec));
     memcpy(hdb[drop].mac, mac, 6);
     return drop;
@@ -279,8 +306,11 @@ static void v4PresenceTick() {
     wn++;
   };
   for (int i = 0; i < hCount; i++) if (hdb[i].flags & HF_PERSON) pushm(hdb[i].mac);
+  for (int k = 0; k < devCount; k++) if (devIsGw(k)) pushm(devs[k].mac);
   for (int k = 0; k < devCount; k++) pushm(devs[k].mac);
   v4WatchSet(&macs[0][0], wn);
+  for (int k = 0; k < devCount; k++) if (devIsGw(k)) hEnsure(devs[k].mac);
+  for (int k = 0; k < devCount; k++) hEnsure(devs[k].mac);
 
   if (!devScanning && now - prSweep >= 1000) {
     prSweep = now;
@@ -324,7 +354,7 @@ static void v4PresenceTick() {
     uint32_t devLast = di >= 0 ? devs[di].last : 0;
     bool radioFresh = heard && (now - heard) < V4_ONLINE_MS;
     bool arpFresh = devLast && (now - devLast) < V4_ONLINE_MS;
-    bool online = sniff ? radioFresh : (radioFresh || arpFresh);
+    bool online = arpFresh || radioFresh || (di >= 0 && devIsGw(di));
     if (!hInit[i]) { hWasOn[i] = online ? 1 : 0; hInit[i] = 1; }
     else if ((hWasOn[i] != 0) != online) {
       if (hdb[i].flips < 250) hdb[i].flips++;
@@ -445,7 +475,7 @@ static void v4AppendDevExtra(JBuf &b, int idx) {
   if (idx < 0 || idx >= devCount || !devs) return;
   int i = hFind(devs[idx].mac);
   bool person = i >= 0 && (hdb[i].flags & HF_PERSON);
-  bool online = i >= 0 && hInit[i] && hWasOn[i];
+  bool online = devLanFresh(idx, millis());
   int up = -1;
   if (i >= 0 && hdb[i].totMin >= 15) up = (int)((100ul * hdb[i].upMin) / hdb[i].totMin);
   int flap = i >= 0 ? hdb[i].flips : 0;

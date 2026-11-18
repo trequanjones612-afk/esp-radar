@@ -31,6 +31,8 @@ struct Light {
   uint8_t bri;
   uint8_t flags;        // bit0: tuya, waiting for a local key
   int8_t rssi;          // last BLE advertisement, 0 if unknown
+  uint8_t lifxMac[6];   // from a StateService header; not stored in NVS
+  uint8_t lifxOk;
   uint32_t seen;
 };
 
@@ -79,7 +81,10 @@ static bool ltSocks = false;
 static bool tuyaBound = false;
 static uint32_t ltScanAt = 0;
 static uint8_t ltSeq = 1;
-static WiFiUDP gUdp, wUdp, lUdp, tUdp6, tUdp7;
+static WiFiUDP gUdp, wUdp, lUdp, tUdp6, tUdp7, tUdp70;
+static int lifxLastType = -1;
+static IPAddress lifxLastIp;
+static void ltPoll();
 static TuyaSec *tuyaKeys = nullptr;
 static const size_t TUYA_BYTES = sizeof(TuyaSec) * TUYA_KEYS;
 static bool lightsDirty = false;
@@ -99,7 +104,7 @@ static int scanN = 0, scanUdp = 0, scanTcp = 0;
 static uint32_t nextUdp = 0, nextTcp = 0;
 struct LtDiag {
   uint16_t gSent, gRx, wSent, wRx, lSent, lRx;
-  uint16_t tHeard, tOpen, tFrame;
+  uint16_t tHeard, tOpen, tFrame, tPkt;
   uint16_t hosts, done;
   bool scanning, whole;
   char phase[28];
@@ -277,7 +282,10 @@ static bool udpText(WiFiUDP &u, const IPAddress &ip, uint16_t port, const char *
   return udpSend(u, ip, port, (const uint8_t *)msg, strlen(msg));
 }
 
-static void lifxHdr(uint8_t *p, uint16_t size, uint16_t type, bool tagged) {
+// tagged=0 and a zero target is ignored by a LIFX bulb for SetPower. GetService
+// still answered (that is how 192.168.4.100 was found). res is bit0 of byte 22,
+// ack is bit1. Target MAC is bytes 8-13, from the StateService header.
+static void lifxHdr(uint8_t *p, uint16_t size, uint16_t type, bool tagged, const uint8_t *mac = nullptr, uint8_t resp = 0) {
   memset(p, 0, size);
   p[0] = size & 0xff;
   p[1] = size >> 8;
@@ -285,7 +293,8 @@ static void lifxHdr(uint8_t *p, uint16_t size, uint16_t type, bool tagged) {
   p[2] = proto & 0xff;
   p[3] = proto >> 8;
   p[4] = 'R'; p[5] = 'A'; p[6] = 'D'; p[7] = 'R';
-  p[22] = 0;
+  if (mac) memcpy(p + 8, mac, 6);
+  p[22] = resp;
   p[23] = ltSeq++;
   p[32] = type & 0xff;
   p[33] = type >> 8;
@@ -308,7 +317,7 @@ static bool ltAlloc() {
 }
 static void ltStopSockets() {
   if (ltSocks) { gUdp.stop(); wUdp.stop(); lUdp.stop(); ltSocks = false; }
-  if (tuyaBound) { tUdp6.stop(); tUdp7.stop(); tuyaBound = false; }
+  if (tuyaBound) { tUdp6.stop(); tUdp7.stop(); tUdp70.stop(); tuyaBound = false; }
 }
 static void ltFree() {
   ltStopSockets();
@@ -379,12 +388,47 @@ static void lanSend(int i, bool on, int bri) {
     else snprintf(buf, sizeof buf, "{\"method\":\"setPilot\",\"params\":{\"state\":false}}");
     udpText(wUdp, ip, 38899, buf);
   } else if (lts[i].brand == BR_LIFX) {
-    uint8_t pkt[42];
-    lifxHdr(pkt, 42, 117, false);
+    if (!lts[i].lifxOk) {
+      uint8_t q[36];
+      lifxHdr(q, 36, 2, false, nullptr, 0x01);
+      udpSend(lUdp, ip, 56700, q, 36);
+      uint32_t t0 = millis();
+      while (!lts[i].lifxOk && (int32_t)(millis() - t0) < 700) {
+        ltPoll();
+        vTaskDelay(pdMS_TO_TICKS(20));
+      }
+    }
+    char macs[18] = "none";
+    if (lts[i].lifxOk)
+      snprintf(macs, sizeof macs, "%02x:%02x:%02x:%02x:%02x:%02x", lts[i].lifxMac[0], lts[i].lifxMac[1], lts[i].lifxMac[2], lts[i].lifxMac[3], lts[i].lifxMac[4], lts[i].lifxMac[5]);
+    if (!lts[i].lifxOk) {
+      snprintf(ltResult, sizeof ltResult, "LIFX %s no MAC from StateService, SetPower not sent", ip.toString().c_str());
+      Serial.printf("# %s\n", ltResult);
+      return;
+    }
     uint16_t level = on ? 65535 : 0;
-    pkt[36] = level & 0xff;
-    pkt[37] = level >> 8;
-    udpSend(lUdp, ip, 56700, pkt, 42);
+    uint8_t p117[42], p21[38];
+    lifxHdr(p117, 42, 117, false, lts[i].lifxMac, 0x03);
+    p117[36] = level & 0xff; p117[37] = level >> 8;
+    lifxHdr(p21, 38, 21, false, lts[i].lifxMac, 0x03);
+    p21[36] = level & 0xff; p21[37] = level >> 8;
+    bool s117 = udpSend(lUdp, ip, 56700, p117, 42);
+    bool s21 = udpSend(lUdp, ip, 56700, p21, 38);
+    lifxLastType = -1;
+    int ack = -1;
+    uint32_t t1 = millis();
+    while ((int32_t)(millis() - t1) < 700) {
+      ltPoll();
+      if ((lifxLastType == 45 || lifxLastType == 22 || lifxLastType == 118) && lifxLastIp == ip) {
+        ack = lifxLastType;
+        break;
+      }
+      vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    snprintf(ltResult, sizeof ltResult, "LIFX %s mac %s SetPower 117 %s, 21 %s, ack %s",
+             ip.toString().c_str(), macs, s117 ? "sent" : "send fail", s21 ? "sent" : "send fail",
+             ack < 0 ? "none" : (ack == 45 ? "ack" : (ack == 22 ? "StatePower" : (ack == 118 ? "StateLightPower" : "StateService"))));
+    Serial.printf("# %s\n", ltResult);
   }
   lts[i].on = on ? 1 : 0;
   if (on) lts[i].bri = (uint8_t)bri;
@@ -467,10 +511,27 @@ static void ingestWiz(const char *js, const IPAddress &from) {
   name[19] = 0;
   if (ltUpsert(BR_WIZ, from, mac, name, "WiZ") >= 0) { diag.wRx++; lightsDirty = true; }
 }
-static void ingestLifx(const IPAddress &from) {
+static void ingestLifx(const IPAddress &from, const uint8_t *pkt, int n) {
+  lifxLastType = -1;
+  lifxLastIp = from;
   char id[24];
   snprintf(id, sizeof id, "lifx-%u.%u.%u.%u", from[0], from[1], from[2], from[3]);
-  if (ltUpsert(BR_LIFX, from, id, "LIFX", "LAN") >= 0) { diag.lRx++; lightsDirty = true; }
+  int i = ltUpsert(BR_LIFX, from, id, "LIFX", "LAN");
+  if (i >= 0) { diag.lRx++; lightsDirty = true; }
+  if (n < 36 || i < 0) return;
+  int typ = pkt[32] | (pkt[33] << 8);
+  lifxLastType = typ;
+  bool zero = true, self = true;
+  uint8_t me[6];
+  WiFi.macAddress(me);
+  for (int b = 0; b < 6; b++) {
+    if (pkt[8 + b]) zero = false;
+    if (pkt[8 + b] != me[b]) self = false;
+  }
+  if (!zero && !self) {
+    memcpy(lts[i].lifxMac, pkt + 8, 6);
+    lts[i].lifxOk = 1;
+  }
 }
 
 static void ltPoll() {
@@ -495,7 +556,7 @@ static void ltPoll() {
     int r = lUdp.read((uint8_t *)buf, sizeof buf - 1);
     if (r < 0) r = 0;
     IPAddress from = lUdp.remoteIP();
-    if (onLan(from) && r >= 36) ingestLifx(from);
+    if (onLan(from) && r >= 36) ingestLifx(from, (const uint8_t *)buf, r);
   }
 }
 
@@ -534,26 +595,50 @@ static void noteTuya(const IPAddress &ip, const char *gw, const char *verStr, bo
   (void)ver;
 }
 
+static void tuyaNoteJson(const char *buf, const IPAddress &from) {
+  char gw[24] = "", ver[8] = "", ipb[16] = "";
+  jstr(buf, "gwId", gw, sizeof gw);
+  if (!gw[0]) jstr(buf, "devId", gw, sizeof gw);
+  jstr(buf, "version", ver, sizeof ver);
+  jstr(buf, "ip", ipb, sizeof ipb);
+  IPAddress ip = from;
+  IPAddress parsed;
+  if (parsed.fromString(ipb) && onLan(parsed)) ip = parsed;
+  if (gw[0] || strstr(buf, "\"gwId\"") || strstr(buf, "productKey") || strstr(buf, "\"ip\""))
+    noteTuya(ip, gw, ver[0] ? ver : "3.5", true);
+}
+
 static void tuyaUdpPoll(WiFiUDP &u) {
-  char buf[400];
+  uint8_t raw[512];
   int n;
   while ((n = u.parsePacket()) > 0) {
-    int r = u.read((uint8_t *)buf, sizeof buf - 1);
+    int r = u.read(raw, sizeof raw);
     if (r < 0) r = 0;
-    buf[r] = 0;
     IPAddress from = u.remoteIP();
-    if (!onLan(from)) continue;
-    if (buf[0] != '{') continue;
-    char gw[24] = "", ver[8] = "", ipb[16] = "";
-    jstr(buf, "gwId", gw, sizeof gw);
-    if (!gw[0]) jstr(buf, "devId", gw, sizeof gw);
-    jstr(buf, "version", ver, sizeof ver);
-    jstr(buf, "ip", ipb, sizeof ipb);
-    IPAddress ip = from;
-    IPAddress parsed;
-    if (parsed.fromString(ipb) && onLan(parsed)) ip = parsed;
-    if (gw[0] || strstr(buf, "\"gwId\"") || strstr(buf, "productKey")) noteTuya(ip, gw, ver, true);
+    if (!onLan(from) || r < 8) continue;
+    diag.tPkt++;
+    char js[400];
+    if (raw[0] == '{') {
+      raw[r < (int)sizeof raw ? r : (int)sizeof raw - 1] = 0;
+      tuyaNoteJson((char *)raw, from);
+    } else if (tuyaDecryptUdp(raw, r, js, sizeof js)) {
+      tuyaNoteJson(js, from);
+    }
   }
+}
+
+// v3.5 devices that stay quiet until asked. PROTOCOL.md: 6699 GCM, cmd 0x25,
+// key MD5("yGAdlopoPVldABfn"), broadcast to UDP 7000. Reply comes back to 7000.
+static void tuyaSolicit() {
+  if (!staUp) return;
+  IPAddress me = WiFi.localIP();
+  char js[80];
+  snprintf(js, sizeof js, "{\"from\":\"app\",\"ip\":\"%u.%u.%u.%u\"}", me[0], me[1], me[2], me[3]);
+  uint8_t pkt[160];
+  int n = frame35(pkt, sizeof pkt, 1, 0x25, (const uint8_t *)js, (int)strlen(js), TUYA_UDP_KEY);
+  if (n <= 0) return;
+  udpSend(tUdp70, IPAddress(me[0], me[1], me[2], 255), 7000, pkt, n);
+  udpSend(tUdp70, IPAddress(255, 255, 255, 255), 7000, pkt, n);
 }
 
 static void rememberOct(uint8_t oct, uint8_t *seen) {
@@ -585,7 +670,12 @@ static void startScan(bool whole) {
   }
   diag.hosts = (uint16_t)scanN;
   strncpy(diag.phase, scanN ? "broadcast" : "no hosts", sizeof diag.phase - 1);
-  if (!tuyaBound) { tUdp6.begin(6666); tUdp7.begin(6667); tuyaBound = true; }
+  if (!tuyaBound) {
+    bool a = tUdp6.begin(6666), b = tUdp7.begin(6667), c = tUdp70.begin(7000);
+    tuyaBound = a || b || c;
+    Serial.printf("# tuya listen 6666=%d 6667=%d 7000=%d\n", a ? 1 : 0, b ? 1 : 0, c ? 1 : 0);
+    tuyaSolicit();
+  }
   broadcastScan();
   nextUdp = millis();
   nextTcp = millis() + 40;
@@ -679,7 +769,7 @@ static void scanPump() {
   if (scanUdp >= scanN && scanTcp >= scanN) {
     diag.scanning = false;
     strncpy(diag.phase, "done", sizeof diag.phase - 1);
-    if (tuyaBound) { tUdp6.stop(); tUdp7.stop(); tuyaBound = false; }
+    if (tuyaBound) { tUdp6.stop(); tUdp7.stop(); tUdp70.stop(); tuyaBound = false; }
     if (lightsDirty) ltSave();
     Serial.printf("# light scan done govee %u/%u wiz %u/%u lifx %u/%u tuya heard %u open %u framed %u\n",
                   diag.gRx, diag.gSent, diag.wRx, diag.wSent, diag.lRx, diag.lSent, diag.tHeard, diag.tOpen, diag.tFrame);
@@ -704,6 +794,10 @@ static void goveeBleMerge() {
 }
 
 static void goveeBlePump() {
+  if (scanning) {
+    snprintf(ltResult, sizeof ltResult, "BLE waiting: WiFi scan in progress");
+    return;
+  }
   if (bleScanReq && !goveeBleScanning) {
     bleScanReq = false;
     goveeBleScan(4);
@@ -756,7 +850,7 @@ static void v4LightsWorker() {
   lanFlush();
   uint32_t now = millis();
   ltPoll();
-  if (tuyaBound) { tuyaUdpPoll(tUdp6); tuyaUdpPoll(tUdp7); }
+  if (tuyaBound) { tuyaUdpPoll(tUdp6); tuyaUdpPoll(tUdp7); tuyaUdpPoll(tUdp70); }
   if (bleScanReq || bleQ >= 0) goveeBlePump();
   else if (qIdx >= 0) tuyaPump();
   else scanPump();
@@ -899,9 +993,11 @@ static void v4AppendLights(JBuf &b) {
          home == 1 ? "home" : (home == 2 ? "away" : (home == 3 ? "checking" : "none")),
          diag.scanning ? "true" : "false");
   b.esc(diag.phase);
-  b.addf("\",\"hosts\":%u,\"done\":%u,\"govee\":[%u,%u],\"wiz\":[%u,%u],\"lifx\":[%u,%u],\"tuyaHeard\":%u,\"tuyaOpen\":%u,\"tuyaFrame\":%u,\"bleScanning\":%s},\"lights\":[",
+  b.addf("\",\"hosts\":%u,\"done\":%u,\"govee\":[%u,%u],\"wiz\":[%u,%u],\"lifx\":[%u,%u],\"tuyaHeard\":%u,\"tuyaOpen\":%u,\"tuyaFrame\":%u,\"tuyaPkt\":%u,\"bleScanning\":%s},\"last\":\"",
          diag.hosts, diag.done, diag.gSent, diag.gRx, diag.wSent, diag.wRx, diag.lSent, diag.lRx,
-         diag.tHeard, diag.tOpen, diag.tFrame, (goveeBleScanning || bleScanReq) ? "true" : "false");
+         diag.tHeard, diag.tOpen, diag.tFrame, diag.tPkt, (goveeBleScanning || bleScanReq) ? "true" : "false");
+  b.esc(ltResult);
+  b.add("\",\"lights\":[");
   for (int i = 0; i < ltN && lts; i++) {
     if (i) b.add(",");
     bool keyed = lts[i].brand == BR_TUYA && tuyaHasKey(lts[i].id);

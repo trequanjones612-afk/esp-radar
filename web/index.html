@@ -405,7 +405,7 @@ function renderLights(j){
   const n=(j.lights||[]).length;
   if($('ldiag')){
     const g=d.govee||[0,0], w=d.wiz||[0,0], l=d.lifx||[0,0];
-    $('ldiag').innerHTML = `Probes sent → replies: Govee ${g[0]}→${g[1]} · WiZ ${w[0]}→${w[1]} · LIFX ${l[0]}→${l[1]} · Tuya broadcasts ${d.tuyaHeard||0}, TCP 6668 open ${d.tuyaOpen||0}, framed ${d.tuyaFrame||0}.${d.bleScanning?' BLE scan in progress — motion rate may dip for a few seconds.':''} ${d.scanning?esc(d.phase||'scanning'): (g[0]&&!g[1]?'Govee LAN: probes went out and nothing answered — LAN Control is off, or that model (H6008 has no switch for it) has no LAN API. Try Scan Govee BLE.':'')}`;
+    $('ldiag').innerHTML = `Probes sent → replies: Govee ${g[0]}→${g[1]} · WiZ ${w[0]}→${w[1]} · LIFX ${l[0]}→${l[1]} · Tuya UDP packets ${d.tuyaPkt||0}, listed ${d.tuyaHeard||0}, TCP 6668 open ${d.tuyaOpen||0}, framed ${d.tuyaFrame||0}.${d.bleScanning?' BLE scan in progress — motion rate may dip for a few seconds.':''} ${d.scanning?esc(d.phase||'scanning'): (g[0]&&!g[1]?'Govee LAN: probes went out and nothing answered — LAN Control is off, or that model (H6008 has no switch for it) has no LAN API. Try Scan Govee BLE.':'')}<br>Last command: ${esc(j.last||'none yet')}`;
   }
   if($('lprog')) $('lprog').style.width = d.hosts ? Math.round(100*(d.done||0)/d.hosts)+'%' : (d.scanning?'5%':'0');
   $('llist').innerHTML=(j.lights||[]).map(L=>{

@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ESP Radar · Web Flasher</title>
+<script type="module" src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"></script>
+<style>
+body{margin:0;min-height:100vh;background:radial-gradient(ellipse at 50% 20%,#03200c,#000 80%);color:#39ff7a;font-family:ui-monospace,Menlo,Consolas,monospace;display:flex;align-items:center;justify-content:center;padding:20px;box-sizing:border-box}
+.box{max-width:520px;border:1px solid rgba(57,255,122,.4);border-radius:14px;padding:24px;background:rgba(0,30,8,.6);box-shadow:0 0 30px rgba(57,255,122,.12)}
+h1{letter-spacing:.2em;font-size:22px;text-shadow:0 0 10px #39ff7a;margin-top:0}p,li{font-size:13px;line-height:1.6;opacity:.85}
+#st{color:#ffcc33;font-size:13px}a{color:#b6ffcf}
+esp-web-install-button button{font:inherit;font-size:16px;letter-spacing:.15em;font-weight:700;background:#39ff7a;color:#021;border:0;border-radius:10px;padding:14px 22px;cursor:pointer;box-shadow:0 0 20px #39ff7a}
+</style></head><body><div class="box">
+<h1>ESP RADAR · WEB FLASHER</h1>
+<p>Flash the Heltec WiFi LoRa 32 V4 straight from Chrome or Edge on a computer (Web Serial). Nothing to install.</p>
+<ol>
+<li>Plug the board in with a USB-C <b>data</b> cable.</li>
+<li>Click <b>CONNECT</b>, pick the board's port, then <b>Install</b>.</li>
+<li>If no port appears / it won't connect: hold <b>PRG</b>, tap <b>RST</b>, release <b>PRG</b>, try again.</li>
+</ol>
+<p id="st">Loading firmware…</p>
+<esp-web-install-button id="btn"><button slot="activate">CONNECT</button>
+  <span slot="unsupported">Your browser has no Web Serial. Use desktop Chrome or Edge.</span>
+  <span slot="not-allowed">This page must be opened over https:// or http://localhost.</span>
+</esp-web-install-button>
+<p>Afterwards: join WiFi <b>ESP-Radar-XXXX</b> (password <b>espradar</b>) and open <b>http://192.168.4.1</b>.</p>
+<p><a href="https://github.com/trequanjones612-afk/esp-radar">github.com/trequanjones612-afk/esp-radar</a></p>
+</div>
+<script>
+// The firmware is stored in the repo as base64 text (firmware/esp-radar-heltec-v4.bin.b64).
+// Decode it in the browser, verify its SHA-256, and hand ESP Web Tools an in-memory manifest.
+const RAW = 'https://raw.githubusercontent.com/trequanjones612-afk/esp-radar/main/firmware/';
+const st = document.getElementById('st');
+(async () => {
+  try {
+    const [b64, sha] = await Promise.all([
+      fetch(RAW + 'esp-radar-heltec-v4.bin.b64').then(r => { if (!r.ok) throw new Error('firmware HTTP ' + r.status); return r.text(); }),
+      fetch(RAW + 'esp-radar-heltec-v4.bin.sha256').then(r => r.text())]);
+    const bin = Uint8Array.from(atob(b64.replace(/\s+/g, '')), c => c.charCodeAt(0));
+    const dig = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', bin))).map(b => b.toString(16).padStart(2, '0')).join('');
+    if (dig !== sha.trim()) throw new Error('checksum mismatch');
+    const binUrl = URL.createObjectURL(new Blob([bin], { type: 'application/octet-stream' }));
+    const manifest = { name: 'ESP Radar', version: '1.0.0', new_install_prompt_erase: true,
+      builds: [{ chipFamily: 'ESP32-S3', parts: [{ path: binUrl, offset: 0 }] }] };
+    document.getElementById('btn').setAttribute('manifest', URL.createObjectURL(new Blob([JSON.stringify(manifest)], { type: 'application/json' })));
+    st.textContent = 'Firmware ready: ' + bin.length.toLocaleString() + ' bytes, sha256 ' + dig.slice(0, 16) + '…';
+    st.style.color = '#39ff7a';
+  } catch (e) { st.textContent = 'Could not load firmware: ' + e.message; }
+})();
+</script></body></html>

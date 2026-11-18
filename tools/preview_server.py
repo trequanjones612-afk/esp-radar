@@ -47,7 +47,7 @@ def state():
     return {"m": m, "p": min(100, m * 0.8), "s": "motion" if HYST["motion"] else "still", "cal": False, "cp": 1,
             "rssi": -47 + random.uniform(-1.5, 1.5), "pps": 64 + random.randint(-4, 4), "ppsAll": 81 + random.randint(-5, 5),
             "ping": 58 + random.randint(-3, 3), "score": 1 + m / 100 * 5.8, "sens": SENS[0], "ip": "192.168.4.91", "ssid": "HomeWiFi",
-            "ap": "ESP-Radar-3F2A", "apip": "192.168.71.1", "ch": 6, "up": bms() // 1000, "setup": False, "sta": True, "now": bms(), "v": "4.1.2-preview","rst":"POWERON","why":"","heap":140000,"minHeap":110000,"ps":2097152,"psFree":1900000,"scanMin":0,"pageMin":120000,"safe":False,
+            "ap": "ESP-Radar-3F2A", "apip": "192.168.71.1", "ch": 6, "up": bms() // 1000, "setup": False, "sta": True, "now": bms(), "v": "4.1.3-preview","rst":"POWERON","why":"","heap":140000,"minHeap":110000,"ps":2097152,"psFree":1900000,"scanMin":0,"pageMin":120000,"safe":False,
             "home": "home", "who": "Pixel", "deb": 12, "time": True, "tz": -240, "night0": 19, "night1": 7,
             "sniff": True, "sniffWant": True, "beta": BETA[0],
             "loud": "Living room TV" if HYST["motion"] else "eero",

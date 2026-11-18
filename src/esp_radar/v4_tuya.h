@@ -115,6 +115,47 @@ static int frame35(uint8_t *out, int cap, uint32_t seq, uint32_t cmd, const uint
   return total;
 }
 
+// Discovery broadcasts on UDP 6667 (and replies on 7000) use the well-known key
+// MD5("yGAdlopoPVldABfn"). tinytuya udp_helper.decrypt_udp and PROTOCOL.md:
+// raw AES-ECB, 55AA frame whose payload is JSON or ECB, or 6699 AES-GCM.
+// 6c1ec8e2bb9bb59ab50b0daf649b410a is that digest, kept so a build without
+// MD5 still decrypts.
+static const uint8_t TUYA_UDP_KEY[16] = {
+  0x6c, 0x1e, 0xc8, 0xe2, 0xbb, 0x9b, 0xb5, 0x9a, 0xb5, 0x0b, 0x0d, 0xaf, 0x64, 0x9b, 0x41, 0x0a
+};
+
+static uint32_t tuyaBe32(const uint8_t *p) {
+  return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+}
+static int tuyaUnpad(uint8_t *b, int n) {
+  if (n <= 0) return 0;
+  uint8_t p = b[n - 1];
+  if (!p || p > 16 || p > n) return n;
+  for (int i = 0; i < p; i++) if (b[n - 1 - i] != p) return n;
+  return n - p;
+}
+static bool tuyaCopyJson(const uint8_t *b, int n, char *out, int cap) {
+  int s = -1;
+  for (int i = 0; i < n; i++) if (b[i] == '{') { s = i; break; }
+  if (s < 0 || cap < 3) return false;
+  int e = n;
+  for (int i = n - 1; i > s; i--) if (b[i] == '}') { e = i + 1; break; }
+  int m = e - s;
+  if (m >= cap) m = cap - 1;
+  memcpy(out, b + s, m);
+  out[m] = 0;
+  return strchr(out, '}') != nullptr;
+}
+static bool tuyaEcbToJson(const uint8_t *in, int n, char *out, int cap) {
+  if (n < 16) return false;
+  n -= n & 15;
+  uint8_t buf[480];
+  if (n > (int)sizeof buf) n = sizeof buf;
+  if (!aesEcb(TUYA_UDP_KEY, in, n, buf, false)) return false;
+  n = tuyaUnpad(buf, n);
+  return tuyaCopyJson(buf, n, out, cap);
+}
+
 static bool gcmDecrypt(const uint8_t key[16], const uint8_t *iv, const uint8_t *aad, int aadLen,
                        const uint8_t *ct, int ctLen, const uint8_t *tag, uint8_t *out) {
   mbedtls_gcm_context g;
@@ -124,6 +165,32 @@ static bool gcmDecrypt(const uint8_t key[16], const uint8_t *iv, const uint8_t *
     rc = mbedtls_gcm_auth_decrypt(&g, ctLen, iv, 12, aad, aadLen, tag, 16, ct, out);
   mbedtls_gcm_free(&g);
   return rc == 0;
+}
+
+// Returns true when `out` holds discovery JSON (gwId / ip / version).
+static bool tuyaDecryptUdp(const uint8_t *msg, int n, char *out, int cap) {
+  if (!msg || n < 16 || !out || cap < 8) return false;
+  if (n >= 20 && memcmp(msg, TUYA_PREFIX, 4) == 0) {
+    uint32_t len = tuyaBe32(msg + 12);
+    int plen = (int)len >= 8 ? (int)len - 8 : 0;
+    if (plen > 0 && 16 + plen <= n) {
+      if (tuyaCopyJson(msg + 16, plen, out, cap)) return true;
+      if (tuyaEcbToJson(msg + 16, plen, out, cap)) return true;
+    }
+    if (n > 28 && tuyaEcbToJson(msg + 20, n - 28, out, cap)) return true;
+  }
+  if (n >= 46 && memcmp(msg, TUYA35_PREFIX, 4) == 0 && memcmp(msg + n - 4, TUYA35_SUFFIX, 4) == 0) {
+    const uint8_t *iv = msg + 18;
+    int ctLen = n - 4 - 16 - 30;
+    if (ctLen > 0 && ctLen < 480) {
+      uint8_t plain[480];
+      if (gcmDecrypt(TUYA_UDP_KEY, iv, msg + 4, 14, msg + 30, ctLen, msg + 30 + ctLen, plain)) {
+        if (tuyaCopyJson(plain, ctLen, out, cap)) return true;
+      }
+    }
+  }
+  if ((n & 15) == 0 && tuyaEcbToJson(msg, n, out, cap)) return true;
+  return false;
 }
 
 static void tcpAbort(WiFiClient &c) {

@@ -34,7 +34,7 @@
 #include "oui_table.h"
 #include "audit_defs.h"
 
-#define FW_VERSION "4.1.2"
+#define FW_VERSION "4.1.3"
 
 // ---------- Heltec WiFi LoRa 32 V4 pins (Heltec pins_arduino.h + Meshtastic variant) ----------
 static const int PIN_VEXT = 36;   // Vext power switch, ACTIVE LOW (powers the OLED)

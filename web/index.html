@@ -63,6 +63,22 @@ a{color:var(--gl)}
 .big{font-size:20px;text-shadow:0 0 8px var(--g)}
 .prog{height:4px;background:rgba(57,255,122,.15);border-radius:2px;margin-top:6px}.prog i{display:block;height:100%;width:0;background:var(--g);box-shadow:0 0 8px var(--g);transition:width .3s}
 .hint{font-size:12px;color:var(--gl);margin-top:6px;min-height:16px}
+
+.sev{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px;vertical-align:-1px;box-shadow:0 0 6px currentColor;background:currentColor}
+.sev-0{color:#555}.sev-1{color:#39ff7a}.sev-2{color:#c8ff3a}.sev-3{color:#ffcc33}.sev-4{color:#ff8c42}.sev-5{color:#ff4d4d}
+.audit-panel{margin-top:8px;padding:10px;border:1px solid rgba(57,255,122,.35);border-radius:10px;background:rgba(0,20,6,.7)}
+.audit-panel h4{font-size:12px;letter-spacing:.15em;margin-bottom:6px}
+.find{border-left:3px solid;padding:6px 8px;margin:6px 0;background:rgba(0,0,0,.3)}
+.find.s1{border-color:#39ff7a}.find.s2{border-color:#c8ff3a}.find.s3{border-color:#ffcc33}.find.s4{border-color:#ff8c42}.find.s5{border-color:#ff4d4d}
+.find b{display:block;margin-bottom:2px}.find small{display:block;opacity:.75;margin-top:3px;line-height:1.35}
+.ports{display:flex;flex-wrap:wrap;gap:4px;margin:6px 0}
+.ports span{font-size:10px;padding:2px 6px;border-radius:6px;border:1px solid rgba(57,255,122,.3)}
+.ports span.open{background:rgba(255,77,77,.15);border-color:#ff4d4d;color:#ffb0b0}
+.ports span.closed{opacity:.35}.ports span.filtered{opacity:.5;border-color:#ffcc33;color:#ffcc33}
+.toggle{display:flex;align-items:center;gap:8px;font-size:12px}
+.toggle input{accent-color:var(--g);width:16px;height:16px}
+#audsum{font-size:12px;margin-top:6px}
+
 </style></head>
 <body>
 <header><div><span id="dot"></span><b>ESP&nbsp;RADAR</b></div><div id="net">connecting…</div></header>
@@ -147,8 +163,21 @@ a{color:var(--gl)}
     <div class="controls"><button id="devscan">⟳ SCAN NETWORK</button><span id="devstat" style="font-size:12px;opacity:.75"></span></div>
     <div class="prog"><i id="devprog"></i></div>
   </div>
-  <div class="card"><h3><span>FOUND</span><span id="devcount"></span></h3><table class="tbl" id="devs"><tr><td>Tap SCAN NETWORK (takes ~15 s).</td></tr></table></div>
-  <p class="note">ARP sweep of your home /24 from the board. Vendor comes from the MAC prefix (a built-in table of common brands); phones usually use a <i>private (randomized) MAC</i> per network, so they show no vendor. Names come from NetBIOS when a device answers. Devices that sleep or ignore ARP may be missed. <b>Only scan networks you own or are allowed to scan.</b></p>
+  <div class="card"><h3><span>SECURITY AUDIT</span><span>pen-test-lite</span></h3>
+    <p class="note" style="margin-top:0">Light check of devices on <b>your own /24</b>: common ports, banners, a few risk flags, and an optional capped default-login check. Not nmap or Metasploit — it can miss things and occasionally mis-flag. No exploits, no password cracking beyond the small default list.</p>
+    <label class="toggle"><input type="checkbox" id="auddef" checked> Try default logins <small style="opacity:.7">(≤8 well-known pairs, stop on first hit, never shows the password)</small></label>
+    <div class="controls" style="margin-top:8px">
+      <button id="audall">🔎 AUDIT ALL</button>
+      <button id="audcancel">■ CANCEL</button>
+      <span id="audstat" style="font-size:12px;opacity:.75"></span>
+    </div>
+    <div class="prog"><i id="audprog"></i></div>
+    <div id="audsum"></div>
+  </div>
+  <div class="card"><h3><span>FOUND</span><span id="devcount"></span></h3><table class="tbl" id="devs"><tr><td>Tap SCAN NETWORK (takes ~15 s).</td></tr></table>
+    <div id="audpanel"></div>
+  </div>
+  <p class="note">ARP sweep of your home /24 from the board. Vendor comes from the MAC prefix (a built-in table of common brands); phones usually use a <i>private (randomized) MAC</i> per network, so they show no vendor. Names come from NetBIOS when a device answers. Devices that sleep or ignore ARP may be missed. <b>Only scan / audit networks you own or are allowed to scan.</b></p>
 </section>
 </main>
 <nav>
@@ -420,20 +449,56 @@ function drawChan(){
 }
 
 // ---------------- DEVICES ----------------
-let devTimer=null;
+let devTimer=null,audTimer=null,audOpen=null;
+const SEV=['unscanned','OK','Low','Medium','High','Critical'];
+const SEVCOL=['#555','#39ff7a','#c8ff3a','#ffcc33','#ff8c42','#ff4d4d'];
 async function loadDevs(){
   try{const j=await (await fetch('/api/devices')).json();const off=Date.now()-j.now;
     $('devsub').textContent=j.subnet||'';$('devprog').style.width=(j.scanning?j.progress:(j.d.length?100:0))+'%';
     $('devstat').textContent=j.scanning?`scanning… ${j.progress}%`:(j.done?`last scan ${fmtT(new Date(off+j.done))}`:'');
     $('devscan').disabled=j.scanning;
     const ipn=s=>+s.split('.')[3];
-    const list=j.d.slice().sort((a,b)=>(b.new-a.new)||ipn(a.ip)-ipn(b.ip));
+    const list=j.d.slice().sort((a,b)=>(b.new-a.new)||((b.audit||0)-(a.audit||0))||ipn(a.ip)-ipn(b.ip));
     $('devcount').textContent=list.length+' devices'+(list.some(x=>x.new)?` · ${list.filter(x=>x.new).length} new`:'');
-    if(list.length)$('devs').innerHTML=list.map(x=>`<tr><td><b>${esc(x.name||x.vendor||'Unknown device')}</b>${x.role?`<span class="tag">${x.role.toUpperCase()}</span>`:''}${x.new?'<span class="tag new">NEW</span>':''}<small>${x.name&&x.vendor?esc(x.vendor):''}</small></td><td>${x.ip}<small>${x.mac}</small></td><td style="text-align:right"><small>first ${fmtT(new Date(off+x.first))}</small><small>last ${fmtT(new Date(off+x.last))}</small></td></tr>`).join('');
+    if(list.length)$('devs').innerHTML=list.map(x=>{
+      const a=x.audit|0;const badge=a?`<span class="sev sev-${a}" title="${SEV[a]}"></span>`:`<span class="sev sev-0" title="not audited"></span>`;
+      return `<tr data-ip="${esc(x.ip)}"><td>${badge}<b>${esc(x.name||x.vendor||'Unknown device')}</b>${x.role?`<span class="tag">${x.role.toUpperCase()}</span>`:''}${x.new?'<span class="tag new">NEW</span>':''}<small>${x.name&&x.vendor?esc(x.vendor):''}</small></td><td>${x.ip}<small>${x.mac}</small></td><td style="text-align:right"><button class="audbtn" data-ip="${esc(x.ip)}">Scan for issues</button><small>first ${fmtT(new Date(off+x.first))}</small><small>last ${fmtT(new Date(off+x.last))}</small></td></tr>`;
+    }).join('');
+    document.querySelectorAll('.audbtn').forEach(b=>b.onclick=()=>startAudit(b.dataset.ip));
     clearTimeout(devTimer);if(j.scanning&&tab==='dev')devTimer=setTimeout(loadDevs,800);
+    pollAudit();
   }catch(e){$('devstat').textContent='board unreachable';}
 }
 $('devscan').onclick=async()=>{const r=await post('/api/devices/scan');if(!r.ok){$('devstat').textContent='needs a home WiFi connection';return;}setTimeout(loadDevs,300);};
+function defFlag(){return $('auddef').checked?'1':'0';}
+async function startAudit(ip){audOpen=ip;$('audpanel').innerHTML='<div class="audit-panel"><h4>Auditing '+esc(ip)+'…</h4><p class="note">Progress below.</p></div>';
+  const r=await post('/api/audit','ip='+encodeURIComponent(ip)+'&def='+defFlag());
+  if(!r.ok){const e=await r.json().catch(()=>({}));$('audpanel').innerHTML='<div class="audit-panel"><h4>Could not start</h4><p>'+esc(e.error||r.status)+'</p></div>';return;}
+  pollAudit(true);}
+$('audall').onclick=async()=>{const r=await post('/api/audit/all','def='+defFlag());if(!r.ok){const e=await r.json().catch(()=>({}));$('audstat').textContent=e.error||'failed';return;}pollAudit(true);};
+$('audcancel').onclick=()=>post('/api/audit/cancel').then(()=>pollAudit(true));
+function renderReport(rep){
+  if(!rep)return '';
+  const ports=(rep.ports||[]).filter(p=>p.state==='open').map(p=>`<span class="open">${p.port}/${p.svc}</span>`).join('')||'<span class="closed">none open</span>';
+  const finds=(rep.findings||[]).map(f=>`<div class="find s${(f.sev|0)+1}"><b>${esc(f.title)}</b>${esc(f.detail)}<small>→ ${esc(f.tip)}</small></div>`).join('')||'<p class="note">No findings.</p>';
+  return `<div class="audit-panel"><h4><span class="sev sev-${(rep.sev|0)+1}"></span>${esc(rep.sevName)} · ${esc(rep.ip)}${rep.role?' · '+esc(rep.role):''}</h4>
+    <p class="note" style="margin:0">Open ports: ${rep.open} · default-login check: ${esc(rep.defResult)}${rep.defTried?` (${rep.defTried} tried)`:''}</p>
+    <div class="ports">${ports}</div>${finds}
+    <p class="note">Light audit only — not a full penetration test. Findings can be wrong or incomplete.</p></div>`;
+}
+async function pollAudit(force){
+  try{
+    const last=audOpen?audOpen.split('.').pop():'';
+    const j=await (await fetch('/api/audit/status'+(last?('?ip='+last):''))).json();
+    const s=await (await fetch('/api/audit/summary')).json();
+    $('audsum').innerHTML=`Audited ${s.total}: <span style="color:${SEVCOL[1]}">${s.ok} OK</span> · <span style="color:${SEVCOL[2]}">${s.low} Low</span> · <span style="color:${SEVCOL[3]}">${s.medium} Med</span> · <span style="color:${SEVCOL[4]}">${s.high} High</span> · <span style="color:${SEVCOL[5]}">${s.critical} Crit</span>`;
+    if(j.running||j.qlen){$('audstat').textContent=(j.running?`auditing …${j.cur} — ${j.phase}`:`queued ${j.qlen}`)+(j.total?` (${j.done}/${j.total})`:'');$('audprog').style.width=(j.total?Math.round(100*j.done/j.total):5)+'%';}
+    else{$('audstat').textContent=j.scanned?`done · ${j.scanned} scanned`:'';$('audprog').style.width=j.scanned?'100%':'0';}
+    if(j.report)$('audpanel').innerHTML=renderReport(j.report);
+    // refresh badges when scans finish
+    if(force||j.running||j.qlen){clearTimeout(audTimer);audTimer=setTimeout(()=>{pollAudit();if(!j.running&&!j.qlen)loadDevs();},j.running?700:1200);}
+  }catch(e){}
+}
 
 // ---------------- render loop ----------------
 let prevT=performance.now();

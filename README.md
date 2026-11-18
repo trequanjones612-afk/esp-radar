@@ -1,4 +1,4 @@
-# 📡 ESP Radar v2
+# 📡 ESP Radar v3
 
 **A WiFi toolkit for the Heltec WiFi LoRa 32 V4 (ESP32-S3).** Flash it with one command and open it on your phone:
 
@@ -8,11 +8,11 @@
 * **Devices**: what's on your home LAN, with IP, MAC, vendor, name, first/last seen, and **NEW** device highlighting.
 
 <p align="center">
-<img src="docs/v2-motion.svg" width="190" alt="Motion tab"> <img src="docs/v2-coverage.svg" width="190" alt="Coverage tab">
-<img src="docs/v2-networks.svg" width="190" alt="Networks tab"> <img src="docs/v2-devices.svg" width="190" alt="Devices tab">
+<img src="docs/v3-motion.svg" width="190" alt="Motion tab"> <img src="docs/v3-coverage.svg" width="190" alt="Coverage tab">
+<img src="docs/v3-networks.svg" width="190" alt="Networks tab"> <img src="docs/v3-devices-audit.svg" width="190" alt="Devices tab">
 </p>
 
-> Screenshots: the real v2 web UI rendered in headless Chrome with a **simulated** data feed (`tools/preview_server.py`), not captured from a live board. The images are PNG screenshots wrapped in SVG so they could be committed as text. The original PNGs are in `docs/` locally.
+> Screenshots: the real v3 web UI rendered in headless Chrome with a **simulated** data feed (`tools/preview_server.py`), not captured from a live board. The images are PNG screenshots wrapped in SVG so they could be committed as text. The original PNGs are in `docs/` locally.
 
 ## ⚡ Flash or update with one command
 
@@ -84,8 +84,20 @@ The board ARP-sweeps your home /24 in small chunks, so it doesn't block anything
 * **Vendor**, from a built-in table of 12.7k MAC prefixes (OUIs) for about 90 common consumer brands. Phones usually use **private (randomized) MACs**, so they show no vendor.
 * **Name**, via NetBIOS, when the device answers.
 * **First and last seen.**
+* A severity badge once you've audited it (colored dot: OK / Low / Medium / High / Critical).
 
 The board remembers the MACs it has seen in its own NVS namespace (`espradar-dev`), so devices that appear in later scans get a **NEW** tag. Devices that sleep or ignore ARP can be missed. **Only scan networks you own or have permission to scan.**
+
+### 🔎 Security audit (pen-test-lite)
+On each device row, **Scan for issues** runs a light audit of that IP from the board. **Audit all** walks the discovered list sequentially. Progress shows while it runs; motion sensing continues between devices.
+
+What it does (all on the board, chunked, non-blocking):
+1. **TCP connect-scan** of 29 common ports: 21 FTP, 22 SSH, 23 Telnet, 25 SMTP, 53 DNS, 80 HTTP, 110 POP3, 135 MSRPC, 139/445 SMB, 143 IMAP, 443 HTTPS, 554 RTSP, 587 SMTP-sub, 1883 MQTT, 2323 Telnet-alt, 3389 RDP, 5000 HTTP/UPnP, 5357 WSD, 7547 TR-069, 8000/8080/8081/8443/9000 alt-HTTP(S), 8554 RTSP-alt, 37777 Dahua, 49152 UPnP, 32764 (historical router backdoor).
+2. **Banner / service grab** on open ports (FTP/SSH/SMTP/Telnet greeting; HTTP GET / for Server, status, WWW-Authenticate, `<title>`). HTTPS connects with an *unverified* TLS client and notes that — if memory is tight, 443 is marked "HTTPS (not inspected)".
+3. **Risk flags** from the above: Telnet open (High), FTP cleartext (Medium), plain-HTTP admin (Low/Medium), TR-069/7547 (Medium), SMB (Medium), RTSP/camera (Medium), RDP (High), dated banners via a small static hint table (Low–Medium — **not** a CVE database), possible 32764 backdoor (High).
+4. **Default-credential check (optional, default ON):** only against an HTTP(S) login that advertised Basic auth, and only a **capped list of 7 universal pairs** (`admin/admin`, `admin/password`, `admin/(blank)`, `root/root`, `user/user`, `admin/1234`, `support/support`) plus **at most one** vendor-specific pair (e.g. `ubnt/ubnt` for Ubiquiti) → **≤ 8 tries total**. One pass, delay between attempts, **stops on the first success**, reports Critical *"default credentials accepted"* **without showing the password**, never retries, never leaves your /24. Toggle: **Try default logins**.
+
+**Guardrails (built in):** only IPs on the board's own /24 are accepted (everything else, including a WAN address, is rejected). No exploits, no payloads, no password cracking beyond that capped list. The UI and this README say clearly: this is a light audit for networks you own, not nmap/Metasploit; it can miss things and occasionally mis-flag.
 
 ## 🎛 Buttons and display
 | | |
@@ -98,7 +110,7 @@ The board remembers the MACs it has seen in its own NVS namespace (`espradar-dev
 
 ## ⚠️ Security and limits
 * The setup network uses a fixed, published password (`espradar`), and the web UI has no login. Anyone on the setup network or your LAN can view it and change the WiFi settings. Treat it as a hobby device.
-* v2 has **not yet been tested on real hardware** (v1 was). The CSI thresholds may need tuning in your room; use the sensitivity slider.
+* v2 was tested on real Heltec V4 hardware (CSI ~79/s, Devices ~48 hosts). v3's audit has **not** been run against real devices yet. The CSI thresholds may need tuning in your room; use the sensitivity slider.
 
 ## 🔙 Back to Meshtastic
 Go to **https://flasher.meshtastic.org** in Chrome or Edge → **Heltec V4** → pick a version → enable **Full Erase and Install** → flash.
@@ -127,6 +139,12 @@ python3 tools/preview_server.py    # preview the phone UI with fake data at http
 ```
 
 ## 📝 Changelog
+**3.0.0**
+* **Security audit (pen-test-lite)** on the Devices tab: per-device "Scan for issues", Audit all, severity badges, progress, session-cached reports.
+* 29-port connect scan + banner/HTTP grab + risk flags + capped default-login check (≤8 pairs, toggleable, stop-on-success).
+* Subnet guard: audits only the board's own /24.
+* Version shown as 3.0.0 in the UI, OLED and serial. Partition table / NVS layout unchanged from v2 (saved WiFi still survives updates).
+
 **2.0.0**
 * **Motion fix:** the setup AP moved to `192.168.71.1`. v1's `192.168.4.1` collided with home LANs on 192.168.4.x; the gateway ping then never reached the router, which left about 8 CSI frames/s (beacons only).
 * Pings now bind to the home WiFi interface and run every 15 ms, with ARP probes as a fallback when the router rate-limits ping. Power save is off (`WIFI_PS_NONE`), and CSI is captured from every frame the AP sends (LLTF plus HT-LTF). The CSI rate, ping rate, and total frame rate are shown in the UI, on the OLED, and in the serial CSV.

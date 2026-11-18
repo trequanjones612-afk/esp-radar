@@ -1,5 +1,5 @@
 /*
-  ESP Radar v2 - WiFi CSI motion meter, WiFi coverage mapper, network + device scanner
+  ESP Radar v3 - WiFi CSI motion meter, WiFi coverage mapper, network + device scanner
   for the Heltec WiFi LoRa 32 V4 (ESP32-S3 + SSD1306/SSD1315 128x64 OLED).
 
   Motion: watches how the WiFi signal from your router fluctuates (Channel State Information,
@@ -17,6 +17,9 @@
 #include <Wire.h>
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
+#include <WiFiClient.h>
+#include <WiFiClientSecure.h>
+#include "mbedtls/base64.h"
 #include <SSD1306Wire.h>
 #include <time.h>
 #include "esp_wifi.h"
@@ -28,8 +31,9 @@
 #include "lwip/tcpip.h"
 #include "web_assets.h"
 #include "oui_table.h"
+#include "audit_defs.h"
 
-#define FW_VERSION "2.0.0"
+#define FW_VERSION "3.0.0"
 
 // ---------- Heltec WiFi LoRa 32 V4 pins (Heltec pins_arduino.h + Meshtastic variant) ----------
 static const int PIN_VEXT = 36;   // Vext power switch, ACTIVE LOW (powers the OLED)
@@ -363,7 +367,7 @@ static void scanTick() {
 }
 
 // ---------- device discovery (ARP sweep of the home /24, chunked, non-blocking) ----------
-struct Dev { uint8_t mac[6]; uint8_t ip4; uint32_t first, last; char name[16]; bool fresh, known; };
+struct Dev { uint8_t mac[6]; uint8_t ip4; uint32_t first, last; char name[16]; bool fresh, known; uint8_t auditSev; };
 static Dev devs[96]; static int devCount = 0;
 static bool devScanning = false; static int devNext = 1; static uint32_t devWaitUntil = 0, devScanStart = 0, devScanDone = 0;
 static bool nbPending = false; static uint32_t nbUntil = 0;
@@ -475,10 +479,250 @@ static String devicesJson() {
     String role = devs[k].ip4 == gw[3] ? "router" : (devs[k].ip4 == base[3] ? "this radar" : "");
     o += "{\"ip\":\"" + String(base[0]) + "." + String(base[1]) + "." + String(base[2]) + "." + String(devs[k].ip4) + "\",\"mac\":\"" + macStr(devs[k].mac) +
          "\",\"vendor\":\"" + vendorOf(devs[k].mac) + "\",\"name\":\"" + jsonEsc(devs[k].name) + "\",\"first\":" + String(devs[k].first) +
-         ",\"last\":" + String(devs[k].last) + ",\"new\":" + (devs[k].fresh ? "true" : "false") + ",\"role\":\"" + role + "\"}";
+         ",\"last\":" + String(devs[k].last) + ",\"new\":" + (devs[k].fresh ? "true" : "false") + ",\"audit\":" + String(devs[k].auditSev) + ",\"role\":\"" + role + "\"}";
   }
   return o + "]}";
 }
+
+// ======================= v3: per-device security audit (pen-test-lite) =======================
+// Scope: ONLY the board's own /24, for networks the user owns. Light checks, not nmap/Metasploit.
+// Non-blocking: runs in its own task so motion sensing keeps going (it only shares the radio).
+
+static portMUX_TYPE auditMux = portMUX_INITIALIZER_UNLOCKED;
+
+static ACache acache[16];
+
+static void auditEnqueue(uint8_t ip4) { portENTER_CRITICAL(&auditMux); int nx = (A.qt + 1) % 80; if (nx != A.qh) { A.queue[A.qt] = ip4; A.qt = nx; } portEXIT_CRITICAL(&auditMux); }
+static int auditQlen() { portENTER_CRITICAL(&auditMux); int n = (A.qt - A.qh + 80) % 80; portEXIT_CRITICAL(&auditMux); return n; }
+static bool auditPop(uint8_t &out) { portENTER_CRITICAL(&auditMux); bool ok = A.qh != A.qt; if (ok) { out = A.queue[A.qh]; A.qh = (A.qh + 1) % 80; } portEXIT_CRITICAL(&auditMux); return ok; }
+static void auditClearQueue() { portENTER_CRITICAL(&auditMux); A.qh = A.qt = 0; portEXIT_CRITICAL(&auditMux); }
+static void setPhase(const char *p, int done, int total) { portENTER_CRITICAL(&auditMux); strncpy(A.phase, p, sizeof(A.phase) - 1); A.phase[sizeof(A.phase) - 1] = 0; A.done = done; A.total = total; portEXIT_CRITICAL(&auditMux); }
+
+static ACache *cacheFor(const uint8_t *mac) {
+  for (auto &c : acache) if (c.used && !memcmp(c.mac, mac, 6)) return &c;
+  return nullptr;
+}
+static void storeReport(const uint8_t *mac, uint8_t sev, const String &json) {
+  ACache *slot = cacheFor(mac);
+  if (!slot) { for (auto &c : acache) if (!c.used) { slot = &c; break; } }
+  if (!slot) { slot = &acache[0]; for (auto &c : acache) if (c.when < slot->when) slot = &c; }   // LRU
+  slot->used = true; memcpy(slot->mac, mac, 6); slot->sev = sev; slot->when = millis(); slot->json = json;
+}
+
+static String b64(const String &in) {
+  size_t ol = 0; uint8_t out[160];
+  if (mbedtls_base64_encode(out, sizeof out, &ol, (const uint8_t *)in.c_str(), in.length()) != 0) return "";
+  out[ol] = 0; return String((char *)out);
+}
+static String hval(const String &head, const char *key) {
+  String lk = head; lk.toLowerCase(); String k = String("\n") + key + ":"; int i = lk.indexOf(k);
+  if (i < 0) return ""; i += k.length(); int e = head.indexOf('\n', i);
+  String v = head.substring(i, e < 0 ? head.length() : e); v.trim(); return v;
+}
+static String printable(const String &in, int maxLen) {
+  String o; for (char c : in) { if (o.length() >= maxLen) break; if (c == '\r' || c == '\n') { if (!o.endsWith(" ")) o += ' '; } else if ((uint8_t)c >= 0x20 && (uint8_t)c < 0x7f) o += c; }
+  o.trim(); return o;
+}
+
+static int probePort(IPAddress ip, uint16_t port, uint32_t to) {   // 2 open, 1 filtered(timeout), 0 closed(refused)
+  WiFiClient c; uint32_t t = millis(); bool ok = c.connect(ip, port, to); uint32_t el = millis() - t; c.stop();
+  if (ok) return 2; return el >= (uint32_t)(to * 0.8f) ? 1 : 0;
+}
+static String grabBanner(IPAddress ip, uint16_t port) {
+  WiFiClient c; if (!c.connect(ip, port, 1200)) return ""; String b; uint32_t t = millis();
+  while (millis() - t < 900 && b.length() < 200) { while (c.available() && b.length() < 200) b += (char)c.read(); delay(10); }
+  c.stop(); return printable(b, 160);
+}
+// GET / and capture status/Server/WWW-Authenticate/<title>. Returns true if we got an HTTP response.
+static bool httpGet(IPAddress ip, uint16_t port, bool secure, int &status, String &server, String &wwwauth, String &title,
+                    bool withAuth, const char *user, const char *pass) {
+  status = -1; WiFiClient plain; WiFiClientSecure sec;
+  WiFiClient *c;
+  if (secure) { if (ESP.getFreeHeap() < 60000) return false; sec.setInsecure(); sec.setTimeout(6); c = &sec; }
+  else { plain.setTimeout(3); c = &plain; }
+  if (!c->connect(ip, port, secure ? 6000 : 2500)) return false;
+  String req = "GET / HTTP/1.1\r\nHost: " + ip.toString() + "\r\nUser-Agent: ESP-Radar-Audit\r\nAccept: */*\r\nConnection: close\r\n";
+  if (withAuth) req += "Authorization: Basic " + b64(String(user) + ":" + pass) + "\r\n";
+  req += "\r\n"; c->print(req);
+  uint32_t t0 = millis(); String head, body; bool inBody = false; int n = 0;
+  while (c->connected() && millis() - t0 < 2500 && n < 8000) {
+    while (c->available() && n < 8000) { char ch = c->read(); n++; if (!inBody) { head += ch; if (head.endsWith("\r\n\r\n")) inBody = true; } else if (body.length() < 4000) body += ch; }
+    delay(4);
+  }
+  c->stop();
+  if (head.length() < 12) return false;
+  int sp = head.indexOf(' '); if (sp > 0) status = head.substring(sp + 1, sp + 4).toInt();
+  server = printable(hval(head, "server"), 80);
+  wwwauth = printable(hval(head, "www-authenticate"), 80);
+  String lb = body; lb.toLowerCase(); int ti = lb.indexOf("<title"); 
+  if (ti >= 0) { int gt = lb.indexOf('>', ti); int te = lb.indexOf("</title", gt); if (gt > 0 && te > gt) title = printable(body.substring(gt + 1, te), 60); }
+  return true;
+}
+// Capped default-credential check: only when a Basic realm was seen. One pass, stop on first success.
+static int tryDefaults(IPAddress ip, uint16_t port, bool secure, const uint8_t *mac, int &nTried) {
+  nTried = 0;
+  const char *vu = nullptr, *vp = nullptr;                 // optional vendor default (keeps total <= 8)
+  String vend = vendorOf(mac);
+  if (vend.indexOf("Ubiquiti") >= 0) { vu = "ubnt"; vp = "ubnt"; }
+  int total = DEF_CREDS_N + (vu ? 1 : 0);
+  for (int i = 0; i < total; i++) {
+    if (A.cancel) return -1;
+    const char *u = i < DEF_CREDS_N ? DEF_CREDS[i].u : vu;
+    const char *p = i < DEF_CREDS_N ? DEF_CREDS[i].p : vp;
+    char ph[40]; snprintf(ph, sizeof ph, "default login %d/%d", i + 1, total); setPhase(ph, i, total);
+    int st; String sv, wa, ti;
+    nTried++;
+    if (httpGet(ip, port, secure, st, sv, wa, ti, true, u, p)) {
+      if (st > 0 && st != 401 && st != 403) return i;       // accepted
+    }
+    delay(400);                                             // gentle: never a tight loop
+  }
+  return -1;
+}
+
+static void addF(String &fj, int &maxSev, int sev, const char *title, const String &detail, const char *tip) {
+  if (sev > maxSev) maxSev = sev;
+  if (fj.length() > 1) fj += ",";
+  fj += "{\"sev\":" + String(sev) + ",\"title\":\"" + jsonEsc(title) + "\",\"detail\":\"" + jsonEsc(detail) + "\",\"tip\":\"" + jsonEsc(tip) + "\"}";
+}
+static void verHints(const String &text, String &fj, int &maxSev, const char *where) {
+  if (text.length() < 2) return;
+  for (int i = 0; i < VER_HINTS_N; i++) if (text.indexOf(VER_HINTS[i].needle) >= 0)
+    addF(fj, maxSev, VER_HINTS[i].sev, "Dated software", String(where) + ": " + text + " - " + VER_HINTS[i].note,
+         "Check the vendor for a firmware update; replace the device if it is end-of-life.");
+}
+
+static void auditOne(uint8_t ip4) {
+  IPAddress me = WiFi.localIP();
+  if (ip4 < 1 || ip4 > 254) return;
+  IPAddress target(me[0], me[1], me[2], ip4);
+  // find the device record / MAC
+  int di = -1; for (int k = 0; k < devCount; k++) if (devs[k].ip4 == ip4) { di = k; break; }
+  uint8_t mac[6] = {0}; if (di >= 0) memcpy(mac, devs[di].mac, 6); else { mac[5] = ip4; mac[0] = 0x02; }
+  bool isSelf = ip4 == me[3], isRouter = ip4 == WiFi.gatewayIP()[3];
+  A.curIp = ip4;
+  String portsJson = "[", findJson = "["; int maxSev = 0, openCount = 0;
+  bool httpOpen = false; uint16_t firstWebPort = 0; bool firstWebSecure = false; String firstWebAuth = "";
+
+  for (int i = 0; i < AUDIT_NPORTS && !A.cancel; i++) {
+    char ph[48]; snprintf(ph, sizeof ph, "scanning :%u (%s)", AUDIT_PORTS[i].port, AUDIT_PORTS[i].svc);
+    setPhase(ph, i, AUDIT_NPORTS);
+    int r = probePort(target, AUDIT_PORTS[i].port, 600);
+    if (r == 2) {
+      openCount++;
+      if (portsJson.length() > 1) portsJson += ",";
+      portsJson += "{\"port\":" + String(AUDIT_PORTS[i].port) + ",\"svc\":\"" + AUDIT_PORTS[i].svc + "\",\"state\":\"open\"}";
+      uint8_t kind = AUDIT_PORTS[i].kind; uint16_t port = AUDIT_PORTS[i].port;
+      String banner = "";
+      if (kind == 3 || kind == 10 || kind == 6) banner = grabBanner(target, port);
+      if (kind == 6) addF(findJson, maxSev, 3, "Telnet is open", "Port " + String(port) + " (Telnet) accepts connections. Telnet sends everything, including passwords, in clear text and is a classic IoT attack vector." + (banner.length() ? " Banner: " + banner : ""),
+                          "Disable Telnet in the device settings; use SSH or the web UI instead.");
+      else if (kind == 10) addF(findJson, maxSev, 2, "FTP is open", "Port 21 (FTP) is open - FTP is unencrypted." + (banner.length() ? " Banner: " + banner : ""),
+                                "Turn off FTP if unused, or switch to SFTP/FTPS. Make sure anonymous access is disabled.");
+      else if (kind == 5 || kind == 11) addF(findJson, maxSev, 2, "Windows file sharing exposed", "Port " + String(port) + " (SMB/RPC) is reachable. Exposed SMB has been the vector for worms like WannaCry.",
+                                             "Limit file sharing to trusted networks and keep the OS patched.");
+      else if (kind == 4) addF(findJson, maxSev, 2, "RTSP camera stream port open", "Port " + String(port) + " (RTSP) is open - this is often an IP camera video stream that may be viewable without a password.",
+                               "Set a strong camera password and disable RTSP if you don't use it.");
+      else if (kind == 7) addF(findJson, maxSev, 3, "Remote Desktop exposed", "Port 3389 (RDP) is open. RDP exposed on the LAN is risky and a common ransomware entry point.",
+                               "Disable RDP if unused; require a strong password and network-level authentication.");
+      else if (kind == 8) addF(findJson, maxSev, 2, "TR-069 remote management open", "Port 7547 (TR-069/CWMP) is open. This ISP remote-management service has had serious past vulnerabilities.",
+                               "If your ISP doesn't require it, disable remote management on the router.");
+      else if (kind == 9) addF(findJson, maxSev, 2, "MQTT broker open", "Port 1883 (MQTT) is open and is often left with no authentication, exposing smart-home messages.",
+                               "Enable authentication/TLS on the broker, or firewall it to trusted devices.");
+      else if (port == 32764) addF(findJson, maxSev, 3, "Possible router backdoor port", "Port 32764 is open - historically a backdoor on some consumer routers.",
+                                   "Update the router firmware; replace it if the vendor no longer patches it.");
+      if (kind == 1 || kind == 2) {
+        bool secure = kind == 2;
+        setPhase("reading web service", i, AUDIT_NPORTS);
+        int st; String sv, wa, ti;
+        if (httpGet(target, port, secure, st, sv, wa, ti, false, "", "")) {
+          httpOpen = true; if (!firstWebPort && wa.indexOf("Basic") >= 0) { firstWebPort = port; firstWebSecure = secure; firstWebAuth = wa; }
+          String d = String(secure ? "HTTPS" : "HTTP") + " on " + String(port) + ": status " + String(st) + (sv.length() ? ", Server: " + sv : "") + (ti.length() ? ", title: " + ti : "");
+          if (secure) d += " (certificate not verified)";
+          int sev = 0; const char *tip = "";
+          bool loginish = wa.indexOf("Basic") >= 0 || ti.indexOf("login") >= 0 || ti.indexOf("Login") >= 0 || ti.indexOf("outer") >= 0 || ti.indexOf("dmin") >= 0;
+          if (!secure && loginish) { sev = 2; tip = "Use HTTPS for the admin page if the device supports it, and set a strong password."; }
+          else if (!secure && port == 80) { sev = 1; tip = "Plain HTTP admin interface - prefer HTTPS and a strong password."; }
+          else if (secure) { sev = 1; tip = "Certificate isn't validated by this light audit; a browser warning usually means a self-signed cert."; }
+          addF(findJson, maxSev, sev, secure ? "HTTPS service" : (loginish ? "Web login over plain HTTP" : "Web service"), d, tip[0] ? tip : "Informational.");
+          verHints(sv, findJson, maxSev, "Server header");
+        } else {
+          String d = String(secure ? "HTTPS" : "HTTP") + " port " + String(port) + " open" + (secure ? " (TLS not inspected)" : " (no response captured)");
+          addF(findJson, maxSev, 0, "Web port open", d, "Informational.");
+        }
+      }
+      if (kind == 3 && banner.length()) verHints(banner, findJson, maxSev, String(AUDIT_PORTS[i].svc).c_str());
+    } else {
+      if (portsJson.length() > 1) portsJson += ",";
+      portsJson += "{\"port\":" + String(AUDIT_PORTS[i].port) + ",\"svc\":\"" + AUDIT_PORTS[i].svc + "\",\"state\":\"" + (r == 1 ? "filtered" : "closed") + "\"}";
+    }
+  }
+  portsJson += "]";
+
+  // default-credential check (capped, opt-outable), only against a Basic-auth web port
+  int defResult = -2;       // -2 skipped, -1 none, >=0 index found
+  int defTried = 0;
+  if (!A.cancel && A.def && firstWebPort) {
+    defResult = tryDefaults(target, firstWebPort, firstWebSecure, mac, defTried);
+    if (defResult >= 0) {
+      const char *u = defResult < DEF_CREDS_N ? DEF_CREDS[defResult].u : "ubnt";
+      addF(findJson, maxSev, 4, "Default login accepted", String("A factory-default username/password worked on the web login (port ") + firstWebPort + "). User \"" + u + "\" with a well-known default password (pair " + String(defResult + 1) + ").",
+           "Change this device's admin password immediately to a unique strong one.");
+    }
+  }
+  findJson += "]";
+
+  if (!A.cancel) {
+    if (openCount == 0) addF(findJson = "[", maxSev, 0, "No common ports open", "None of the " + String(AUDIT_NPORTS) + " audited ports responded. The device may be firewalled, asleep, or only use ports outside this list.", "Nothing to do."), findJson += "]";
+    const char *names[] = {"OK", "Low", "Medium", "High", "Critical"};
+    String rep = "{\"ip\":\"" + target.toString() + "\",\"mac\":\"" + macStr(mac) + "\",\"vendor\":\"" + vendorOf(mac) + "\",\"sev\":" + String(maxSev) +
+                 ",\"sevName\":\"" + names[maxSev] + "\",\"when\":" + String(millis()) + ",\"role\":\"" + String(isRouter ? "router" : (isSelf ? "this radar" : "")) +
+                 "\",\"open\":" + String(openCount) + ",\"def\":" + (A.def ? "true" : "false") + ",\"defTried\":" + String(defTried) +
+                 ",\"defResult\":\"" + (defResult == -2 ? "skipped" : (defResult == -1 ? "none" : "found")) + "\",\"ports\":" + portsJson + ",\"findings\":" + findJson + "}";
+    storeReport(mac, (uint8_t)maxSev, rep);
+    if (di >= 0) devs[di].auditSev = (uint8_t)(maxSev + 1);    // 0 = unscanned; 1..5 = OK..Critical
+    A.scanned++;
+    Serial.printf("# audit %s sev=%s open=%d def=%s\n", target.toString().c_str(), names[maxSev], openCount, defResult >= 0 ? "FOUND" : (defResult == -1 ? "none" : "skipped"));
+  }
+}
+
+static void auditTask(void *) {
+  for (;;) {
+    uint8_t ip4;
+    if (!A.running && auditPop(ip4)) {
+      A.running = true; A.cancel = false;
+      if (staUp) auditOne(ip4);
+      A.running = false; A.curIp = 0;
+      if (auditQlen() == 0) setPhase("", 0, 0);
+    } else delay(120);
+  }
+}
+
+static String auditStatusJson(int wantIp) {
+  String o = "{\"running\":" + String(A.running ? "true" : "false") + ",\"cur\":" + String(A.curIp) +
+             ",\"done\":" + String(A.done) + ",\"total\":" + String(A.total) + ",\"qlen\":" + String(auditQlen()) +
+             ",\"scanned\":" + String(A.scanned) + ",\"def\":" + String(A.def ? "true" : "false") + ",\"phase\":\"" + jsonEsc(A.phase) + "\"";
+  if (wantIp > 0) {
+    IPAddress me = WiFi.localIP(); String rep = "null";
+    for (int k = 0; k < devCount; k++) if (devs[k].ip4 == wantIp) { ACache *c = cacheFor(devs[k].mac); if (c) rep = c->json; break; }
+    o += ",\"report\":" + rep;
+  }
+  return o + "}";
+}
+static String auditSummaryJson() {
+  int cnt[5] = {0, 0, 0, 0, 0}, tot = 0;
+  for (auto &c : acache) if (c.used) { cnt[c.sev]++; tot++; }
+  return "{\"total\":" + String(tot) + ",\"ok\":" + String(cnt[0]) + ",\"low\":" + String(cnt[1]) + ",\"medium\":" + String(cnt[2]) +
+         ",\"high\":" + String(cnt[3]) + ",\"critical\":" + String(cnt[4]) + ",\"running\":" + String(A.running ? "true" : "false") +
+         ",\"qlen\":" + String(auditQlen()) + "}";
+}
+// validate "a.b.c.d" is on our own /24
+static bool sameSubnet(const String &ipStr, uint8_t &last) {
+  IPAddress ip; if (!ip.fromString(ipStr)) return false; IPAddress me = WiFi.localIP();
+  if (!staUp || ip[0] != me[0] || ip[1] != me[1] || ip[2] != me[2]) return false;
+  if (ip[3] < 1 || ip[3] > 254) return false; last = ip[3]; return true;
+}
+// ======================= end v3 audit =======================
 
 // ---------- web server ----------
 static void sendGz(AsyncWebServerRequest *r, const uint8_t *d, size_t n, const char *type) {
@@ -514,6 +758,27 @@ static void setupWeb() {
   });
   server.on("/api/sample", HTTP_GET, [](AsyncWebServerRequest *r) { sendJson(r, sampleJson()); });
   server.on("/api/devices", HTTP_GET, [](AsyncWebServerRequest *r) { sendJson(r, devicesJson()); });
+  server.on("/api/audit/status", HTTP_GET, [](AsyncWebServerRequest *r) {
+    int ip = r->hasParam("ip") ? r->getParam("ip")->value().toInt() : 0;
+    sendJson(r, auditStatusJson(ip));
+  });
+  server.on("/api/audit/summary", HTTP_GET, [](AsyncWebServerRequest *r) { sendJson(r, auditSummaryJson()); });
+  server.on("/api/audit", HTTP_POST, [](AsyncWebServerRequest *r) {
+    if (!staUp) { r->send(409, "application/json", "{\"error\":\"not connected to home WiFi\"}"); return; }
+    if (r->hasParam("def", true)) A.def = r->getParam("def", true)->value() == "1";
+    uint8_t last;
+    if (!r->hasParam("ip", true) || !sameSubnet(r->getParam("ip", true)->value(), last)) { r->send(400, "application/json", "{\"error\":\"IP must be on this board's own /24\"}"); return; }
+    A.cancel = false; auditEnqueue(last);
+    sendJson(r, "{\"queued\":1,\"ip\":" + String(last) + "}");
+  });
+  server.on("/api/audit/all", HTTP_POST, [](AsyncWebServerRequest *r) {
+    if (!staUp) { r->send(409, "application/json", "{\"error\":\"not connected to home WiFi\"}"); return; }
+    if (r->hasParam("def", true)) A.def = r->getParam("def", true)->value() == "1";
+    A.cancel = false; int n = 0; IPAddress me = WiFi.localIP();
+    for (int k = 0; k < devCount; k++) if (devs[k].ip4 != me[3]) { auditEnqueue(devs[k].ip4); n++; }
+    sendJson(r, "{\"queued\":" + String(n) + "}");
+  });
+  server.on("/api/audit/cancel", HTTP_POST, [](AsyncWebServerRequest *r) { A.cancel = true; auditClearQueue(); sendJson(r, "{\"ok\":true}"); });
   server.on("/api/devices/scan", HTTP_POST, [](AsyncWebServerRequest *r) {
     if (!staUp) { r->send(409, "application/json", "{\"error\":\"not connected to home WiFi\"}"); return; }
     if (!devScanning) { devScanning = true; devNext = 1; devWaitUntil = 0; devScanStart = millis(); }
@@ -649,6 +914,7 @@ void setup() {
 
   csiQ = xQueueCreate(64, sizeof(CsiPkt));
   xTaskCreatePinnedToCore(csiTask, "csi", 8192, nullptr, 3, nullptr, 0);
+  xTaskCreatePinnedToCore(auditTask, "audit", 12288, nullptr, 1, nullptr, 1);
 
   WiFi.persistent(false);
   WiFi.mode(WIFI_AP_STA);

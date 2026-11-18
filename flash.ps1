@@ -154,7 +154,7 @@ function Install-EspRadar {
 
   Write-Host @'
 
-  ESP Radar v2 is flashed! Next steps:
+  ESP Radar is flashed! Next steps:
     * Already set up before? It rejoins your WiFi by itself - open http://esp-radar.local
       (or the IP on the OLED). Keep the room still for the 10 s calibration.
     * New board / erased: the OLED shows "SETUP MODE". On your phone join WiFi

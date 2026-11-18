@@ -33,7 +33,7 @@ def state():
     return {"m": m, "p": min(100, m * 0.8), "s": "motion" if HYST["motion"] else "still", "cal": False, "cp": 1,
             "rssi": -47 + random.uniform(-1.5, 1.5), "pps": 64 + random.randint(-4, 4), "ppsAll": 81 + random.randint(-5, 5),
             "ping": 58 + random.randint(-3, 3), "score": 1 + m / 100 * 5.8, "sens": SENS[0], "ip": "192.168.4.91", "ssid": "HomeWiFi",
-            "ap": "ESP-Radar-3F2A", "apip": "192.168.71.1", "ch": 6, "up": bms() // 1000, "setup": False, "sta": True, "now": bms(), "v": "2.0.0-preview"}
+            "ap": "ESP-Radar-3F2A", "apip": "192.168.71.1", "ch": 6, "up": bms() // 1000, "setup": False, "sta": True, "now": bms(), "v": "3.0.0-preview"}
 
 NETS = [("HomeWiFi", "A4:2B:B0:11:22:33", 6, -44, "WPA2/WPA3"), ("HomeWiFi-IoT", "A6:2B:B0:11:22:34", 6, -46, "WPA2"),
         ("NETGEAR47", "9C:3D:CF:AA:01:02", 1, -71, "WPA2"), ("xfinitywifi", "3A:1C:22:9B:00:10", 1, -78, "OPEN"),
@@ -46,6 +46,26 @@ DEVS = [("192.168.4.1", "A4:2B:B0:11:22:33", "TP-Link", "", "router"), ("192.168
         ("192.168.4.52", "D8:EB:46:10:20:30", "Google", "", ""), ("192.168.4.60", "7C:2E:BD:11:00:22", "Roku", "", ""),
         ("192.168.4.91", "48:CA:43:3F:2A:10", "Espressif", "esp-radar", "this radar"), ("192.168.4.112", "3C:84:6A:90:12:34", "TP-Link", "", ""),
         ("192.168.4.140", "6E:21:9A:00:42:7F", "Private (randomized) MAC", "", "")]
+
+
+AUDIT = {"running": False, "cur": 0, "done": 0, "total": 29, "qlen": 0, "scanned": 3, "def": True, "phase": "", "open_ip": None}
+REPORTS = {
+  "192.168.4.1": {"ip":"192.168.4.1","mac":"A4:2B:B0:11:22:33","vendor":"TP-Link","sev":0,"sevName":"OK","when":1000,"role":"router","open":2,"def":True,"defTried":0,"defResult":"skipped",
+    "ports":[{"port":80,"svc":"HTTP","state":"open"},{"port":443,"svc":"HTTPS","state":"open"},{"port":22,"svc":"SSH","state":"closed"},{"port":23,"svc":"Telnet","state":"closed"}],
+    "findings":[{"sev":1,"title":"Web service","detail":"HTTPS on 443: status 200, Server: nginx (certificate not verified)","tip":"Certificate isn't validated by this light audit; a browser warning usually means a self-signed cert."},
+                {"sev":0,"title":"Web service","detail":"HTTP on 80: status 301, title: Router","tip":"Informational."}]},
+  "192.168.4.60": {"ip":"192.168.4.60","mac":"7C:2E:BD:11:00:22","vendor":"Roku","sev":2,"sevName":"Medium","when":2000,"role":"","open":3,"def":True,"defTried":0,"defResult":"skipped",
+    "ports":[{"port":80,"svc":"HTTP","state":"open"},{"port":8080,"svc":"HTTP-alt","state":"open"},{"port":8060,"svc":"HTTP-alt","state":"closed"}],
+    "findings":[{"sev":1,"title":"Web service","detail":"HTTP on 80: status 200, Server: Roku UPnP, title: Roku","tip":"Plain HTTP admin interface - prefer HTTPS and a strong password."},
+                {"sev":2,"title":"Web login over plain HTTP","detail":"HTTP on 8080: status 401, WWW-Authenticate: Basic","tip":"Use HTTPS for the admin page if the device supports it, and set a strong password."}]},
+  "192.168.4.112": {"ip":"192.168.4.112","mac":"3C:84:6A:90:12:34","vendor":"TP-Link","sev":4,"sevName":"Critical","when":3000,"role":"","open":4,"def":True,"defTried":3,"defResult":"found",
+    "ports":[{"port":23,"svc":"Telnet","state":"open"},{"port":80,"svc":"HTTP","state":"open"},{"port":554,"svc":"RTSP","state":"open"},{"port":8080,"svc":"HTTP-alt","state":"open"}],
+    "findings":[{"sev":3,"title":"Telnet is open","detail":"Port 23 (Telnet) accepts connections. Telnet sends everything, including passwords, in clear text and is a classic IoT attack vector. Banner: BusyBox v1.20.2","tip":"Disable Telnet in the device settings; use SSH or the web UI instead."},
+                {"sev":2,"title":"RTSP camera stream port open","detail":"Port 554 (RTSP) is open - this is often an IP camera video stream that may be viewable without a password.","tip":"Set a strong camera password and disable RTSP if you don't use it."},
+                {"sev":2,"title":"Web login over plain HTTP","detail":"HTTP on 80: status 401, Server: GoAhead, title: IP Camera","tip":"Use HTTPS for the admin page if the device supports it, and set a strong password."},
+                {"sev":2,"title":"Dated software","detail":"Server header: GoAhead - GoAhead embedded webserver - common on cheap IP cameras with known issues","tip":"Check the vendor for a firmware update; replace the device if it is end-of-life."},
+                {"sev":4,"title":"Default login accepted","detail":"A factory-default username/password worked on the web login (port 80). User \"admin\" with a well-known default password (pair 1).","tip":"Change this device's admin password immediately to a unique strong one."}]},
+}
 
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
@@ -76,9 +96,25 @@ class H(BaseHTTPRequestHandler):
         if p == "/api/devices":
             el = time.time() - DEVSCAN["start"]; scanning = el < 6; prog = min(100, int(el / 6 * 100))
             shown = DEVS if not scanning else DEVS[:max(1, int(len(DEVS) * prog / 100))]
+            aud_map = {"192.168.4.1":1,"192.168.4.60":3,"192.168.4.112":5,"192.168.4.91":1}
             d = [{"ip": ip, "mac": m, "vendor": v, "name": n, "first": now - (300000 if i < 9 else 40000), "last": now - random.randint(0, 20000),
-                  "new": i >= 9 and role == "", "role": role} for i, (ip, m, v, n, role) in enumerate(shown)]
+                  "new": i >= 9 and role == "", "role": role, "audit": aud_map.get(ip, 0)} for i, (ip, m, v, n, role) in enumerate(shown)]
             return self.j({"now": now, "scanning": scanning, "progress": prog, "done": now - 30000, "subnet": "192.168.4.0/24", "known": 9, "d": d})
+        
+        if p == "/api/audit/status":
+            ip = 0
+            if "ip=" in self.path:
+                try: ip = int(self.path.split("ip=")[1].split("&")[0])
+                except: pass
+            tip = f"{DEVS[0][0].rsplit('.',1)[0]}.{ip}" if ip else None
+            rep = REPORTS.get(tip) if tip else None
+            if AUDIT["open_ip"]:
+                tip2 = AUDIT["open_ip"]; rep = REPORTS.get(tip2, rep)
+            return self.j({"running": AUDIT["running"], "cur": AUDIT["cur"], "done": AUDIT["done"], "total": AUDIT["total"],
+                           "qlen": AUDIT["qlen"], "scanned": AUDIT["scanned"], "def": AUDIT["def"], "phase": AUDIT["phase"], "report": rep})
+        if p == "/api/audit/summary":
+            return self.j({"total": 3, "ok": 1, "low": 0, "medium": 1, "high": 0, "critical": 1, "running": AUDIT["running"], "qlen": AUDIT["qlen"]})
+
         if p == "/events":
             self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.send_header("Cache-Control", "no-cache"); self.end_headers()
             try:
@@ -91,6 +127,16 @@ class H(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length") or 0); body = self.rfile.read(n).decode()
         if self.path == "/api/sens" and body.startswith("v="): SENS[0] = int(body[2:])
         if self.path == "/api/sample": SAMPLE["id"] += 1; SAMPLE["start"] = time.time(); return self.j({"id": SAMPLE["id"], "busy": True, "n": 0})
+        
+        if self.path == "/api/audit":
+            AUDIT["def"] = "def=1" in body; ip = body.split("ip=")[1].split("&")[0] if "ip=" in body else ""
+            AUDIT["running"]=True; AUDIT["cur"]=int(ip.split(".")[-1]) if ip else 0; AUDIT["open_ip"]=ip; AUDIT["phase"]="scanning :80 (HTTP)"; AUDIT["done"]=8; AUDIT["qlen"]=0
+            return self.j({"queued":1,"ip":AUDIT["cur"]})
+        if self.path == "/api/audit/all":
+            AUDIT["def"]="def=1" in body; AUDIT["running"]=True; AUDIT["qlen"]=5; AUDIT["phase"]="queued"; return self.j({"queued":5})
+        if self.path == "/api/audit/cancel":
+            AUDIT["running"]=False; AUDIT["qlen"]=0; AUDIT["phase"]=""; return self.j({"ok":True})
+
         if self.path == "/api/devices/scan": DEVSCAN["start"] = time.time()
         self.j({"ok": True})
 

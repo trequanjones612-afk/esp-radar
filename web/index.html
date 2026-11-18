@@ -137,10 +137,32 @@ a{color:var(--gl)}
   </div>
   <div class="card beta" id="lightcard"><h3><span>BETA · SMART LIGHTS</span><span>off by default</span></h3>
     <label class="toggle"><input type="checkbox" id="beta"> Enable beta — local LAN only, no cloud account and no API key</label>
-    <p class="note">Govee lights need <b>LAN Control</b> turned on for each device in the Govee Home app (device settings). WiZ and LIFX are discovered on the local network the same way. Some meshes (including eero) block phone-to-device UDP; if nothing is found, the lights and this board must be able to see each other's broadcasts. This has not been tested on hardware.</p>
+    <p class="note">Discovery sends a <b>unicast</b> probe to each host already on the Devices list (Govee UDP 4001, WiZ 38899, LIFX 56700), and still sends multicast and broadcast as well. eero often drops broadcast between mesh nodes; unicast is the path that still works. <b>Govee LAN Control is per device</b> in the Govee Home app, and only some Govee models support it — zero Govee replies after a unicast sweep means those bulbs are not in LAN mode, not that the packet was lost. Tuya and CloudyBay show up as “found, needs local key”; the key stays on the board and is never shown again. Untested on hardware.</p>
     <div id="lbody" style="display:none">
-      <div class="controls" style="margin-top:8px"><button id="lscan">⟳ LOOK FOR LIGHTS</button><button id="loff">ALL OFF</button><span id="lstat" style="font-size:12px;opacity:.75"></span></div>
+      <div class="controls" style="margin-top:8px">
+        <button id="lscan">⟳ LOOK FOR LIGHTS</button>
+        <label class="toggle"><input type="checkbox" id="lwhole"> whole /24</label>
+        <button id="loff">ALL OFF</button>
+      </div>
+      <div id="ldiag" class="note"></div>
+      <div class="prog"><i id="lprog"></i></div>
+      <div class="controls" style="margin-top:8px">
+        <input id="lip" type="text" placeholder="light IP" maxlength="15" style="max-width:140px">
+        <button id="ladd">PROBE THIS IP</button>
+        <button id="lblescan">SCAN GOVEE BLE</button>
+      </div>
+      <p class="note">H6008 (and other Govee bulbs with no LAN Control switch) can be driven over Bluetooth instead. The board uses the ESP32-S3 NimBLE stack, scans only when you ask (about 4 seconds, and the WiFi motion rate will dip for that long), then connects just long enough to write one on/off or brightness command. No keep-alive timer, and no Govee cloud. Practical range is about one or two rooms. Untested on hardware.</p>
       <div id="llist" style="margin-top:8px"></div>
+      <h3 style="margin-top:12px"><span>TUYA LOCAL KEY</span><span>write-only</span></h3>
+      <p class="note" style="margin-top:0">Device id and local key come from the Tuya / Smart Life developer tools or a local-key extractor you already trust. The key is stored only in the board’s settings (NVS). This page never displays it. Protocol 3.3, 3.4 and 3.5 are implemented from the public local protocol and have not been tried on a real bulb.</p>
+      <div class="controls">
+        <select id="tuyaPick"><option value="">pick a Tuya light</option></select>
+        <input id="tuyaDev" type="text" placeholder="device id" maxlength="23" style="max-width:160px" autocomplete="off">
+        <input id="tuyaKey" type="password" placeholder="local key" maxlength="16" style="max-width:140px" autocomplete="new-password">
+        <select id="tuyaVer"><option value="33">3.3</option><option value="34">3.4</option><option value="35">3.5</option></select>
+        <button id="tuyaSave">SAVE KEY</button>
+        <button id="tuyaClear">FORGET KEY</button>
+      </div>
       <h3 style="margin-top:12px"><span>RULE</span><span id="rstat"></span></h3>
       <div class="controls">
         <select id="rlink"><option value="-1">any path</option></select>
@@ -376,9 +398,28 @@ $('pick').onclick=showTalkers;
 let lights=null;
 function renderLights(j){
   lights=j; const on=!!j.beta; $('beta').checked=on; $('lbody').style.display=on?'block':'none';
-  $('lstat').textContent=on?(j.lights||[]).length+' found':'';
-  $('llist').innerHTML=(j.lights||[]).map(L=>`<div class="link"><div class="nm"><b>${esc(L.name||L.brand)}</b><small>${esc(L.brand)} · ${esc(L.ip)} · ${L.on?'on':'off'}${L.brand==='lifx'?' · on/off only':''}</small></div><button class="lt" data-id="${esc(L.id)}" data-op="on">ON</button><button class="lt" data-id="${esc(L.id)}" data-op="off">OFF</button></div>`).join('')||'<p class="note">None found yet. Enable LAN Control in the Govee app, then look again.</p>';
+  const d=j.diag||{};
+  const n=(j.lights||[]).length;
+  if($('ldiag')){
+    const g=d.govee||[0,0], w=d.wiz||[0,0], l=d.lifx||[0,0];
+    $('ldiag').innerHTML = `Probes sent → replies: Govee ${g[0]}→${g[1]} · WiZ ${w[0]}→${w[1]} · LIFX ${l[0]}→${l[1]} · Tuya broadcasts ${d.tuyaHeard||0}, TCP 6668 open ${d.tuyaOpen||0}, framed ${d.tuyaFrame||0}.${d.bleScanning?' BLE scan in progress — motion rate may dip for a few seconds.':''} ${d.scanning?esc(d.phase||'scanning'): (g[0]&&!g[1]?'Govee LAN: probes went out and nothing answered — LAN Control is off, or that model (H6008 has no switch for it) has no LAN API. Try Scan Govee BLE.':'')}`;
+  }
+  if($('lprog')) $('lprog').style.width = d.hosts ? Math.round(100*(d.done||0)/d.hosts)+'%' : (d.scanning?'5%':'0');
+  $('llist').innerHTML=(j.lights||[]).map(L=>{
+    const extra=L.brand==='lifx'?' · on/off only':(L.brand==='govee-ble'?` · BLE ${L.rssi?L.rssi+' dBm':''}`:(L.needsKey?' · found, needs local key':(L.hasKey?' · key saved':'')));
+    return `<div class="link"><div class="nm"><b>${esc(L.name||L.brand)}</b><small>${esc(L.brand)} · ${esc(L.ip)} · ${L.on?'on':'off'}${extra}</small></div><button class="lt" data-id="${esc(L.id)}" data-op="on">ON</button><button class="lt" data-id="${esc(L.id)}" data-op="off">OFF</button></div>`;
+  }).join('')||'<p class="note">None yet. Scan the Devices tab first so this board knows who is on the LAN, then look for lights. Or type an IP.</p>';
   $('llist').querySelectorAll('.lt').forEach(b=>b.onclick=()=>post('/api/lights/test','id='+encodeURIComponent(b.dataset.id)+'&op='+b.dataset.op+'&bri='+$('rbri').value).then(loadLights));
+  const pick=$('tuyaPick');
+  if(pick && document.activeElement!==pick){
+    const cur=pick.value;
+    const tuy=(j.lights||[]).filter(L=>L.brand==='tuya' || String(L.id).startsWith('ip-'));
+    pick.innerHTML='<option value="">pick a Tuya / manual IP</option>'+tuy.map(L=>`<option value="${esc(L.ip)}">${esc(L.name||L.ip)} · ${esc(L.ip)}${L.hasKey?' · key saved':''}</option>`).join('');
+    if([...pick.options].some(o=>o.value===cur)) pick.value=cur;
+  }
+  const chosen=(j.lights||[]).find(L=>pick && L.ip===pick.value);
+  if($('tuyaKey') && chosen) $('tuyaKey').placeholder = chosen.hasKey ? 'key saved on board — type to replace' : 'local key';
+  if($('tuyaDev') && chosen && document.activeElement!==$('tuyaDev') && !String(chosen.id).startsWith('ip-') && !String(chosen.id).startsWith('tuya-')) $('tuyaDev').value=chosen.id;
   const ids=new Set(((j.rules||[])[0]||{}).ids||[]);
   $('rlts').innerHTML=(j.lights||[]).map(L=>`<label class="toggle"><input type="checkbox" class="rid" value="${esc(L.id)}" ${ids.has(L.id)?'checked':''}> ${esc(L.name||L.id)}</label>`).join('')||'<span class="note">no lights yet</span>';
   const r=(j.rules||[])[0];
@@ -391,7 +432,18 @@ function renderLights(j){
 }
 async function loadLights(){ try{ renderLights(await (await fetch('/api/lights')).json()); }catch(e){} }
 $('beta').onchange=()=>post('/api/lights/beta','v='+($('beta').checked?'1':'0')).then(loadLights);
-$('lscan').onclick=()=>{ $('lstat').textContent='looking…'; loadLights(); };
+$('lscan').onclick=()=>post('/api/lights/scan','whole='+($('lwhole').checked?'1':'0')).then(loadLights);
+$('ladd').onclick=()=>post('/api/lights/ip','ip='+encodeURIComponent($('lip').value.trim())).then(loadLights);
+$('lblescan').onclick=()=>post('/api/lights/ble').then(()=>setTimeout(loadLights, 1500));
+$('tuyaSave').onclick=()=>{
+  const ip=$('tuyaPick').value; if(!ip) return;
+  post('/api/lights/tuya','ip='+encodeURIComponent(ip)+'&dev='+encodeURIComponent($('tuyaDev').value.trim())+'&key='+encodeURIComponent($('tuyaKey').value)+'&ver='+$('tuyaVer').value)
+    .then(()=>{ $('tuyaKey').value=''; loadLights(); });
+};
+$('tuyaClear').onclick=()=>{
+  const ip=$('tuyaPick').value; if(!ip) return;
+  post('/api/lights/tuya','ip='+encodeURIComponent(ip)+'&clear=1').then(()=>{ $('tuyaKey').value=''; loadLights(); });
+};
 $('loff').onclick=()=>post('/api/lights/test','op=offall').then(loadLights);
 $('rsave').onclick=()=>{
   const ids=[...document.querySelectorAll('.rid')].filter(x=>x.checked).map(x=>x.value).join(',');
@@ -399,7 +451,7 @@ $('rsave').onclick=()=>{
   post('/api/lights/rule','i=0&used=1&link='+link+'&room='+encodeURIComponent($('rroom').value.trim().slice(0,15))+'&ids='+encodeURIComponent(ids)+'&timeout='+encodeURIComponent($('rmin').value||'5')+'&bri='+$('rbri').value+'&night='+($('rnight').checked?1:0)+'&home='+($('rhome').checked?1:0)).then(loadLights);
 };
 $('rclear').onclick=()=>post('/api/lights/rule','i=0&used=0').then(loadLights);
-setInterval(()=>{ if(tab==='motion') loadLights(); }, 8000);
+setInterval(()=>{ if(tab==='motion') loadLights(); }, 2000);
 post('/api/clock','tz='+(-new Date().getTimezoneOffset()));
 loadLights();
 

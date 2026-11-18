@@ -1,4 +1,4 @@
-# 📡 ESP Radar v4
+# 📡 ESP Radar v4.1
 
 **A WiFi toolkit for the Heltec WiFi LoRa 32 V4 (ESP32-S3).** Flash it with one command and open it on your phone:
 
@@ -131,9 +131,9 @@ What it does (all on the board, chunked, non-blocking):
 ## 💡 Beta smart lights (off by default)
 On the Motion tab, **BETA · SMART LIGHTS** is off until you turn it on. Nothing is discovered and no UDP is sent until then. There is no Govee / WiZ / LIFX account and no API key. Commands stay on your LAN.
 
-**Govee:** in the Govee Home app, open each light → settings → **LAN Control**, and turn it on. The light has to be on the same LAN as the board. The board scans with the documented local UDP API (multicast `239.255.255.250:4001` and a broadcast, replies on UDP 4002, on/off and brightness to the bulb's port 4003).
+**Govee:** in the Govee Home app, open each light → settings → **LAN Control**, and turn it on. Only some Govee models implement that switch. The board still multicasts to `239.255.255.250:4001` and broadcasts, and **v4.1 also unicasts** a scan to each known host’s port 4001 (replies on UDP 4002, commands to port 4003), because eero often drops the broadcast. The diagnostics line is `sent → replies`. Zero replies after a unicast sweep means those bulbs did not answer, which is LAN Control off or an unsupported model, not a missing packet.
 
-**WiZ** (on/off and brightness) and **LIFX** (on/off only; brightness would change the color, so it is not sent) use the same on-device drivers. Another local-API brand can be added the same way. GE Cync is not included: it has no local API that works without an account.
+**WiZ** (on/off and brightness, unicast `getPilot` to UDP 38899) and **LIFX** (on/off only, unicast GetService to UDP 56700; brightness would change the color, so it is not sent) use the same rule engine. **Tuya and CloudyBay** are listed when UDP 6666/6667 is heard or TCP 6668 answers. They need a local key you type in; it is stored only on the board and is not shown again. Control uses DPs 20/22, then 1/2. Protocol 3.3, 3.4 and 3.5 are implemented from the public local protocol and are **untested on hardware**. GE Cync is not included: it has no local API that works without an account.
 
 **Rules (one in the UI, up to four in the firmware):** motion on a chosen path, any path, or a room label you typed on a path, turns the chosen lights on. They turn off N minutes after that motion stops (1–180, default 5). Optional: only at night (default 19:00–07:00, using the timezone your phone sends), and/or only when Home. **ON / OFF** next to a found light is a manual test. **ALL OFF** is the panic button.
 
@@ -179,6 +179,11 @@ python3 tools/preview_server.py    # preview the phone UI with fake data at http
 ```
 
 ## 📝 Changelog
+**4.1.0**
+* **Unicast light discovery.** eero drops a lot of UDP broadcast and multicast, which is why v4.0.0’s Look for lights found nothing. A scan now probes each host on the Devices list (or, if you tick it, the whole /24) with unicast: Govee scan to port 4001, WiZ `getPilot` to 38899, LIFX GetService to 56700. Multicast and broadcast are still sent. Probes are rate-limited and the UI shows progress plus a per-protocol sent/replies count, so “LAN Control off” (probes went out, zero replies) is distinct from “nothing was sent”. You can also type a light’s IP. Found lights are stored in the `espradar-v4` settings namespace. NVS at `0x9000` and the partition table are unchanged.
+* **Tuya / CloudyBay.** Listens for UDP 6666/6667 and checks TCP 6668 on the hosts it is already probing. Those show up as “found, needs local key”. Optional per-device device id, local key, and protocol 3.3 / 3.4 / 3.5. On/off/brightness uses DPs 20 and 22, then 1 and 2 if the first command gets no framed reply. The key is stored only on the board, is not returned by the API, is not written to the serial log, and the UI uses a password field that stays empty after you save.
+* **Beta Govee BLE** for models with no LAN Control, including H6008. The ESP32-S3 core already uses NimBLE; the firmware uses that stack and does not add a second one. A scan is only when you tap it (about 4 seconds, 30 ms of each 100 ms, so WiFi keeps most of the air). Names starting with `ihoment_`, `Govee_`, or `GBK_` are listed with RSSI. On/off and brightness are the community 20-byte `0x33` packets with an XOR checksum, written to `00010203-0405-0607-0809-0a0b0c0d2b11`, then the link is dropped. No keep-alive timer and no Govee cloud. Those bulbs can be targets of the same motion rules. Range is about one or two rooms. **Untested on hardware.** CSI impact was not measured on a board: with BLE idle, the router rate should stay where it is (about 68/s on the v4.0.0 report); a scan or a command will dip it for those few seconds and then it should come back.
+
 **4.0.0**
 * **Motion paths.** Promiscuous mode so CSI can come from other transmitters on the board's 2.4 GHz channel, not only the router. Up to 5 extra links plus the router. Per-link calibration, baseline, and motion word. Auto-pick or manual pick. Friendly name (device alias, NetBIOS, or vendor) and an optional room label. The UI says which device-to-board path is disturbed, not a position. If a link is heard but CSI is too slow, that link falls back to RSSI variance and is labeled RSSI. Sniffer can be turned off; the router path stays.
 * **Device health** on the existing ARP discovery: online/offline, uptime %, last dropout, flapping, overnight (once the phone's timezone is known), NEW and unknown-vendor highlighting. Small NVS record in `espradar-dev`. No new port scan and no credential check. The v3 audit is unchanged.

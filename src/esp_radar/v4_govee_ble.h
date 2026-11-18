@@ -30,6 +30,7 @@
 // current rate; expect a dip only during that scan or connection. Not measured here.
 #pragma once
 #include <Arduino.h>
+#include "v4_mem.h"
 #include <BLEDevice.h>
 #include <BLEScan.h>
 #include <BLEAdvertisedDevice.h>
@@ -49,11 +50,22 @@ struct GoveeBleHit {
   char model[8];
   bool used;
 };
-static GoveeBleHit goveeHits[GOVEE_BLE_MAX];
+static GoveeBleHit *goveeHits = nullptr;
 static int goveeHitN = 0;
 static bool goveeBleReady = false;
 static bool goveeBleScanning = false;
 static BLEClient *goveeClient = nullptr;
+
+static bool goveeBleStorage() {
+  if (goveeHits) return true;
+  goveeHits = (GoveeBleHit *)psAlloc(sizeof(GoveeBleHit) * GOVEE_BLE_MAX, "govee-ble");
+  return goveeHits != nullptr;
+}
+static void goveeBleStorageFree() {
+  free(goveeHits);
+  goveeHits = nullptr;
+  goveeHitN = 0;
+}
 
 static bool goveeNameOk(const String &n) {
   return n.startsWith("ihoment_") || n.startsWith("IHoment_") || n.startsWith("Govee_") || n.startsWith("govee_") ||
@@ -74,7 +86,7 @@ static void goveeModel(const char *name, char *model, int cap) {
 
 class GoveeScanCb : public BLEAdvertisedDeviceCallbacks {
   void onResult(BLEAdvertisedDevice dev) override {
-    if (!dev.haveName()) return;
+    if (!goveeHits || !dev.haveName()) return;
     String n = dev.getName();
     if (!goveeNameOk(n)) return;
     String mac = dev.getAddress().toString();
@@ -120,11 +132,11 @@ static bool goveeBleInit() {
 
 // Blocks for `seconds`. Caller must not be the async web task.
 static int goveeBleScan(uint32_t seconds) {
-  if (!goveeBleInit()) return -1;
+  if (!goveeBleStorage() || !goveeBleInit()) return -1;
   if (seconds < 2) seconds = 2;
   if (seconds > 6) seconds = 6;
   goveeHitN = 0;
-  memset(goveeHits, 0, sizeof goveeHits);
+  memset(goveeHits, 0, sizeof(GoveeBleHit) * GOVEE_BLE_MAX);
   goveeBleScanning = true;
   BLEScan *scan = BLEDevice::getScan();
   scan->setAdvertisedDeviceCallbacks(&goveeScanCb, false);
@@ -155,7 +167,7 @@ static void goveePacket(uint8_t pkt[20], uint8_t cmd, uint8_t a, uint8_t b = 0) 
 }
 
 static bool goveeBleWrite(const char *mac, uint8_t addrType, bool on, int briPct) {
-  if (!mac || !mac[0] || !goveeBleInit()) return false;
+  if (!mac || !mac[0] || !goveeBleStorage() || !goveeBleInit()) return false;
   if (!goveeClient) goveeClient = BLEDevice::createClient();
   if (!goveeClient) { goveeBleShutdown(); return false; }
   if (goveeClient->isConnected()) goveeClient->disconnect();

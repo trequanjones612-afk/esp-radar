@@ -15,6 +15,7 @@
 // that link falls back to RSSI variance. The UI labels it as the weaker signal.
 #pragma once
 #include <Arduino.h>
+#include "v4_mem.h"
 #include <WiFi.h>
 #include <Preferences.h>
 #include <esp_wifi.h>
@@ -98,7 +99,7 @@ struct LinkRT {
 };
 
 static LinkCfg linkCfg[V4_LINKS];
-static LinkRT rt[V4_LINKS];
+static LinkRT *rt = nullptr;   // PSRAM. The WiFi callback only writes a few fields; the rings are read by the CSI task.
 static LinkView pub[V4_LINKS];
 static portMUX_TYPE radioMux = portMUX_INITIALIZER_UNLOCKED;
 static volatile uint32_t cfgGen = 1, appliedGen = 0;
@@ -134,7 +135,12 @@ static bool macAp(const uint8_t *m) {
   return macEq(m, b);
 }
 
+static void v4MotionMem() {
+  if (!rt) rt = (LinkRT *)psAlloc(sizeof(LinkRT) * V4_LINKS, "csi-links");
+}
+
 static void resetLink(int i) {
+  if (!rt) return;
   LinkRT &L = rt[i];
   memset(L.ring, 0, sizeof L.ring);
   memset(L.rsum, 0, sizeof L.rsum);
@@ -160,7 +166,7 @@ static void resetLink(int i) {
 }
 
 static void radioSee(const uint8_t *mac, int8_t rssi, bool direct) {
-  if (!mac || macGroup(mac) || macSelf(mac)) return;
+  if (!rt || !mac || macGroup(mac) || macSelf(mac)) return;
   uint32_t now = millis();
   portENTER_CRITICAL(&radioMux);
   for (int i = 0; i < watchN; i++) {
@@ -219,7 +225,7 @@ static void csiCb(void *ctx, wifi_csi_info_t *info) {
   if (link < 0) return;
   if (info->len < 128) return;                 // not a full LLTF; RSSI for this MAC is counted in the sniffer
   // Keep the queue for real CSI. When the AP is busy, shed extra router frames so other links still fit.
-  if (link == 0 && uxQueueMessagesWaiting(csiQ) > 40) { csiDrop = csiDrop + 1; return; }
+  if (link == 0 && uxQueueMessagesWaiting(csiQ) > 16) { csiDrop = csiDrop + 1; return; }
   CsiPkt p;
   memcpy(p.buf, info->buf, 128);
   p.len = 128;
@@ -245,6 +251,7 @@ static void promiscCb(void *buf, wifi_promiscuous_pkt_type_t type) {
 static inline bool usableSc(int k) { return (k >= 2 && k <= 26) || (k >= 38 && k <= 63); }
 
 static void ingest(int link, const int8_t *buf, int8_t rssi) {
+  if (!rt) return;
   LinkRT &L = rt[link];
   if (!L.active && link != 0) return;
   float amp[V4_NSC];
@@ -296,6 +303,7 @@ static void ingest(int link, const int8_t *buf, int8_t rssi) {
 }
 
 static void evalLink(int idx, uint32_t now) {
+  if (!rt) return;
   LinkRT &L = rt[idx];
   float var[V4_NSC], ratio[V4_NSC];
   bool ready = L.ringFill >= V4_WIN / 2;
@@ -399,6 +407,7 @@ static const char *linkState(const LinkRT &L) {
 }
 
 static void publish(float ppsAll, float pingRate) {
+  if (!rt) return;
   LinkView next[V4_LINKS];
   for (int i = 0; i < V4_LINKS; i++) {
     LinkView &v = next[i];
@@ -448,6 +457,7 @@ static void csiTask(void *) {
   uint32_t lastCsi[V4_LINKS] = {0}, lastRssi[V4_LINKS] = {0};
   float ppsAll = 0, pingRate = 0;
   for (;;) {
+    if (!rt) { vTaskDelay(pdMS_TO_TICKS(50)); continue; }
     bool got = xQueueReceive(csiQ, &p, pdMS_TO_TICKS(50)) == pdTRUE;
     uint32_t now = millis();
     if (reqRecal) { reqRecal = false; recalWhich = -1; }
@@ -609,7 +619,7 @@ static void startCsi() {
 }
 
 static void v4Start() {
-  csiQ = xQueueCreate(64, sizeof(CsiPkt));
+  csiQ = xQueueCreate(24, sizeof(CsiPkt));   // internal; the callback cannot use PSRAM for the queue storage
   xTaskCreatePinnedToCore(csiTask, "csi", 10240, nullptr, 3, nullptr, 0);
 }
 
@@ -899,60 +909,63 @@ static String macColon(const uint8_t *m) {
   return String(b);
 }
 
-static String v4LinksJsonArray() {
-  String o = "[";
+static void v4AppendLinks(JBuf &b) {
+  b.add("[");
   for (int i = 0; i < V4_LINKS; i++) {
     LinkView v;
     v4View(i, v);
-    if (i) o += ",";
-    o += "{\"i\":" + String(i) + ",\"mac\":\"" + (v.active ? macColon(v.mac) : String("")) + "\",\"name\":\"";
-    jsonAppendEsc(o, v.name);
-    o += "\",\"room\":\"";
-    jsonAppendEsc(o, v.room);
-    o += "\",\"m\":" + String(v.level, 1) + ",\"sc\":" + String(v.score, 2) + ",\"pps\":" + String(v.pps, 0) +
-         ",\"rssi\":" + String(v.rssi, 0) + ",\"s\":\"" + String(v.st) + "\",\"src\":\"" +
-         String(v.src == 1 ? "csi" : (v.src == 2 ? "rssi" : "none")) + "\",\"on\":" + String(v.active ? "true" : "false") + "}";
+    if (i) b.add(",");
+    char mac[18] = "";
+    if (v.active) snprintf(mac, sizeof mac, "%02X:%02X:%02X:%02X:%02X:%02X", v.mac[0], v.mac[1], v.mac[2], v.mac[3], v.mac[4], v.mac[5]);
+    b.addf("{\"i\":%d,\"mac\":\"%s\",\"name\":\"", i, mac);
+    b.esc(v.name);
+    b.add("\",\"room\":\"");
+    b.esc(v.room);
+    b.addf("\",\"m\":%.1f,\"sc\":%.2f,\"pps\":%.0f,\"rssi\":%.0f,\"s\":\"%s\",\"src\":\"%s\",\"on\":%s}",
+           v.level, v.score, v.pps, v.rssi, v.st, v.src == 1 ? "csi" : (v.src == 2 ? "rssi" : "none"), v.active ? "true" : "false");
   }
-  return o + "]";
+  b.add("]");
 }
 
-static String v4MotionSuffix() {
+static void v4AppendMotion(JBuf &b) {
   LinkView loud;
   v4Loud(loud);
-  String o = ",\"sniff\":" + String(sniffOn ? "true" : "false") + ",\"sniffWant\":" + String(sniffUser ? "true" : "false") +
-             ",\"loud\":\"";
-  jsonAppendEsc(o, loud.name);
-  o += "\",\"loudm\":" + String(loud.level, 1) + ",\"louds\":\"" + String(loud.st) + "\",\"links\":" + v4LinksJsonArray();
-  return o;
+  b.addf(",\"sniff\":%s,\"sniffWant\":%s,\"loud\":\"", sniffOn ? "true" : "false", sniffUser ? "true" : "false");
+  b.esc(loud.name);
+  b.addf("\",\"loudm\":%.1f,\"louds\":\"%s\",\"links\":", loud.level, loud.st);
+  v4AppendLinks(b);
 }
 
-static String v4TalkersJson() {
+static void v4AppendTalkers(JBuf &b) {
   V4Talk copy[V4_TALK];
   portENTER_CRITICAL(&radioMux);
   memcpy(copy, talkers, sizeof copy);
   portEXIT_CRITICAL(&radioMux);
-  String o = "{\"sniff\":" + String(sniffOn ? "true" : "false") + ",\"talkers\":[";
+  b.addf("{\"sniff\":%s,\"talkers\":[", sniffOn ? "true" : "false");
   bool first = true;
   for (int i = 0; i < V4_TALK; i++) {
     if (!copy[i].hits) continue;
-    if (!first) o += ",";
+    if (!first) b.add(",");
     first = false;
+    char mac[18];
+    snprintf(mac, sizeof mac, "%02X:%02X:%02X:%02X:%02X:%02X", copy[i].mac[0], copy[i].mac[1], copy[i].mac[2], copy[i].mac[3], copy[i].mac[4], copy[i].mac[5]);
+    b.addf("{\"mac\":\"%s\",\"hits\":%u,\"rssi\":%d,\"vendor\":\"", mac, copy[i].hits, (int)copy[i].rssi);
     const char *vend = vendorOf(copy[i].mac);
-    o += "{\"mac\":\"" + macColon(copy[i].mac) + "\",\"hits\":" + String(copy[i].hits) + ",\"rssi\":" + String((int)copy[i].rssi) +
-         ",\"vendor\":\"";
-    jsonAppendEsc(o, vend ? vend : "");
-    o += "\"}";
+    b.esc(vend ? vend : "");
+    b.add("\"}");
   }
-  o += "],\"links\":" + v4LinksJsonArray() + "}";
-  return o;
+  b.add("],\"links\":");
+  v4AppendLinks(b);
+  b.add("}");
 }
 
-static String activityJson() {
-  String o = "{\"now\":" + String(millis()) + ",\"minuteStart\":" + String((millis() / 60000) * 60000) + ",\"cur\":{\"avg\":" +
-             String(bN ? (int)(bSum / bN) : 0) + ",\"peak\":" + String(bPeak) + ",\"mot\":" + String(bN ? (int)(100 * bMot / bN) : 0) + "},\"b\":[";
+static void v4AppendActivity(JBuf &b) {
+  b.addf("{\"now\":%lu,\"minuteStart\":%lu,\"cur\":{\"avg\":%d,\"peak\":%u,\"mot\":%d},\"b\":[",
+         (unsigned long)millis(), (unsigned long)((millis() / 60000) * 60000),
+         bN ? (int)(bSum / bN) : 0, bPeak, bN ? (int)(100 * bMot / bN) : 0);
   for (int i = 0; i < actCount; i++) {
-    if (i) o += ",";
-    o += "[" + String(act[i].avg) + "," + String(act[i].peak) + "," + String(act[i].motionPct) + "]";
+    if (i) b.add(",");
+    b.addf("[%u,%u,%u]", act[i].avg, act[i].peak, act[i].motionPct);
   }
-  return o + "]}";
+  b.add("]}");
 }

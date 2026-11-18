@@ -9,6 +9,7 @@
 // as away while the person is home. Untested on hardware.
 #pragma once
 #include <Arduino.h>
+#include "v4_mem.h"
 #include <WiFi.h>
 #include <Preferences.h>
 #include <time.h>
@@ -42,14 +43,15 @@ struct PLog {
   char name[16];
 };
 
-static HRec hdb[HMAX];
+static HRec *hdb = nullptr;
 static int hCount = 0;
 static uint8_t hWasOn[HMAX];
 static uint8_t hInit[HMAX];
 static uint8_t hHits[HMAX];
 static uint32_t hPrevMs[HMAX];
 static uint32_t hPrevDev[HMAX];
-static PLog plog[16];
+static const int PLOG_N = 16;
+static PLog *plog = nullptr;
 static int pCount = 0;
 static int tzEast = 0;
 static uint8_t night0 = 19, night1 = 7;
@@ -58,6 +60,11 @@ static uint32_t prTick = 0, prSweep = 0, prPeople = 0, prSave = 0, prDecay = 0, 
 static bool prDirty = false;
 static char homeWho[48] = "";
 static const char *homeWord = "none";
+
+static void v4PresenceMem() {
+  if (!hdb) hdb = (HRec *)psAlloc(sizeof(HRec) * HMAX, "health");
+  if (!plog) plog = (PLog *)psAlloc(sizeof(PLog) * PLOG_N, "presence-log");
+}
 
 static bool v4TimeOk(struct tm &t) {
   time_t e = time(nullptr);
@@ -92,10 +99,12 @@ static const char *v4HomeLabel() {
 }
 
 static int hFind(const uint8_t *mac) {
+  if (!hdb) return -1;
   for (int i = 0; i < hCount; i++) if (!memcmp(hdb[i].mac, mac, 6)) return i;
   return -1;
 }
 static int hEnsure(const uint8_t *mac) {
+  if (!hdb) return -1;
   int i = hFind(mac);
   if (i >= 0) return i;
   if (hCount >= HMAX) {
@@ -112,12 +121,13 @@ static int hEnsure(const uint8_t *mac) {
 }
 
 static void v4PresenceSave(bool force) {
+  if (!hdb || !plog) return;
   if (!force && !prDirty) return;
   Preferences p;
   p.begin("espradar-dev", false);
   p.putBytes("hlth", hdb, hCount * sizeof(HRec));
   p.putUChar("hn", (uint8_t)hCount);
-  p.putBytes("plog", plog, sizeof plog);
+  if (plog) p.putBytes("plog", plog, sizeof(PLog) * PLOG_N);
   p.putUChar("pn", (uint8_t)pCount);
   p.end();
   Preferences q;
@@ -131,7 +141,9 @@ static void v4PresenceSave(bool force) {
 }
 
 static void v4PresenceLoad() {
+  v4PresenceMem();
   prBoot = millis();
+  if (!hdb || !plog) return;
   Preferences p;
   p.begin("espradar-dev", true);
   int n = p.getUChar("hn", 0);
@@ -141,9 +153,9 @@ static void v4PresenceLoad() {
     p.getBytes("hlth", hdb, hCount * sizeof(HRec));
   }
   int pn = p.getUChar("pn", 0);
-  if (pn > 16) pn = 16;
+  if (pn > PLOG_N) pn = PLOG_N;
   if (pn && p.getBytesLength("plog") >= sizeof(PLog) * (size_t)pn) {
-    p.getBytes("plog", plog, sizeof plog);
+    p.getBytes("plog", plog, sizeof(PLog) * PLOG_N);
     pCount = pn;
   }
   p.end();
@@ -167,7 +179,8 @@ static void v4PresenceLoad() {
 }
 
 static void pPush(bool arrive, const uint8_t *mac, const char *name) {
-  if (pCount == 16) { memmove(plog, plog + 1, sizeof(PLog) * 15); pCount = 15; }
+  if (!plog) return;
+  if (pCount >= PLOG_N) { memmove(plog, plog + 1, sizeof(PLog) * (PLOG_N - 1)); pCount = PLOG_N - 1; }
   PLog &e = plog[pCount++];
   memset(&e, 0, sizeof e);
   e.ms = millis();
@@ -428,8 +441,8 @@ static void v4PresenceTick() {
   if (prDirty && now - prSave > 5ul * 60ul * 1000ul) v4PresenceSave(false);
 }
 
-static String v4DevExtra(int idx) {
-  if (idx < 0 || idx >= devCount) return "";
+static void v4AppendDevExtra(JBuf &b, int idx) {
+  if (idx < 0 || idx >= devCount || !devs) return;
   int i = hFind(devs[idx].mac);
   bool person = i >= 0 && (hdb[i].flags & HF_PERSON);
   bool online = i >= 0 && hInit[i] && hWasOn[i];
@@ -440,35 +453,37 @@ static String v4DevExtra(int idx) {
   uint32_t drop = i >= 0 ? hdb[i].lastDropEpoch : 0;
   uint32_t hours = 0;
   if (i >= 0) hours = (uint32_t)hdb[i].hours[0] | ((uint32_t)hdb[i].hours[1] << 8) | ((uint32_t)hdb[i].hours[2] << 16);
-  const char *alias = i >= 0 ? hdb[i].alias : "";
-  String o = ",\"alias\":\"";
-  jsonAppendEsc(o, alias);
-  o += "\",\"person\":" + String(person ? "true" : "false") + ",\"online\":" + String(online ? "true" : "false") +
-       ",\"up\":" + String(up) + ",\"flap\":" + String(flap) + ",\"night\":" + String(night) +
-       ",\"drop\":" + String(drop) + ",\"hours\":" + String(hours) +
-       ",\"radio\":" + String(v4MacDirect(devs[idx].mac) ? "true" : "false");
-  return o;
+  b.add(",\"alias\":\"");
+  b.esc(i >= 0 ? hdb[i].alias : "");
+  b.addf("\",\"person\":%s,\"online\":%s,\"up\":%d,\"flap\":%d,\"night\":%d,\"drop\":%lu,\"hours\":%lu,\"radio\":%s",
+         person ? "true" : "false", online ? "true" : "false", up, flap, night, (unsigned long)drop, (unsigned long)hours,
+         v4MacDirect(devs[idx].mac) ? "true" : "false");
 }
 
-static String v4PresenceSuffix() {
-  String o = ",\"home\":\"" + String(homeWord) + "\",\"who\":\"";
-  jsonAppendEsc(o, homeWho);
-  o += "\",\"deb\":12,\"time\":" + String(v4Epoch() ? "true" : "false") + ",\"tz\":" + String(tzEast) +
-       ",\"night0\":" + String(night0) + ",\"night1\":" + String(night1);
-  return o;
+static void v4AppendPresence(JBuf &b) {
+  b.add(",\"home\":\"");
+  b.add(homeWord);
+  b.add("\",\"who\":\"");
+  b.esc(homeWho);
+  b.addf("\",\"deb\":12,\"time\":%s,\"tz\":%d,\"night0\":%u,\"night1\":%u",
+         v4Epoch() ? "true" : "false", tzEast, night0, night1);
 }
 
-static String v4PresenceJson() {
-  String o = "{\"home\":\"" + String(homeWord) + "\",\"who\":\"";
-  jsonAppendEsc(o, homeWho);
-  o += "\",\"debounceMin\":12,\"tz\":" + String(tzEast) + ",\"night0\":" + String((int)night0) +
-       ",\"night1\":" + String((int)night1) + ",\"time\":" + String(v4Epoch() ? "true" : "false") + ",\"log\":[";
-  for (int i = pCount - 1; i >= 0; i--) {
-    if (i != pCount - 1) o += ",";
-    o += "{\"t\":" + String(plog[i].ms) + ",\"epoch\":" + String(plog[i].epoch) + ",\"arrive\":" +
-         String(plog[i].arrive ? "true" : "false") + ",\"mac\":\"" + macStr(plog[i].mac) + "\",\"name\":\"";
-    jsonAppendEsc(o, plog[i].name);
-    o += "\"}";
+static void v4AppendPresenceJson(JBuf &b) {
+  b.add("{\"home\":\"");
+  b.add(homeWord);
+  b.add("\",\"who\":\"");
+  b.esc(homeWho);
+  b.addf("\",\"debounceMin\":12,\"tz\":%d,\"night0\":%u,\"night1\":%u,\"time\":%s,\"log\":[",
+         tzEast, night0, night1, v4Epoch() ? "true" : "false");
+  for (int i = pCount - 1; i >= 0 && plog; i--) {
+    if (i != pCount - 1) b.add(",");
+    char mac[18];
+    snprintf(mac, sizeof mac, "%02X:%02X:%02X:%02X:%02X:%02X", plog[i].mac[0], plog[i].mac[1], plog[i].mac[2], plog[i].mac[3], plog[i].mac[4], plog[i].mac[5]);
+    b.addf("{\"t\":%lu,\"epoch\":%lu,\"arrive\":%s,\"mac\":\"%s\",\"name\":\"",
+           (unsigned long)plog[i].ms, (unsigned long)plog[i].epoch, plog[i].arrive ? "true" : "false", mac);
+    b.esc(plog[i].name);
+    b.add("\"}");
   }
-  return o + "]}";
+  b.add("]}");
 }

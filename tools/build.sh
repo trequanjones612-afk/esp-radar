@@ -5,9 +5,13 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="${OUT:-$ROOT/build}"
-FQBN="esp32:esp32:heltec_wifi_lora_32_V4:PartitionScheme=no_ota,CDCOnBoot=cdc"
+FQBN="esp32:esp32:heltec_wifi_lora_32_V4:PartitionScheme=no_ota,CDCOnBoot=cdc,PSRAM=enabled"
 python3 "$ROOT/tools/embed_web.py"
-arduino-cli compile -b "$FQBN" --warnings default --output-dir "$OUT" "$ROOT/src/esp_radar"
+# Cap the async queues. v4.1.1 left SSE at 32 messages per client, and each
+# state event is an internal allocation, which is what walked the heap down
+# to 1 KB while the Motion page was open.
+EXTRA="-DSSE_MAX_QUEUED_MESSAGES=2 -DWS_MAX_QUEUED_MESSAGES=4 -DDEFAULT_MAX_WS_CLIENTS=2 -DCONFIG_ASYNC_TCP_QUEUE_SIZE=16 -DCONFIG_ASYNC_TCP_STACK_SIZE=8192"
+arduino-cli compile -b "$FQBN" --warnings default --build-property "compiler.cpp.extra_flags=${EXTRA}" --output-dir "$OUT" "$ROOT/src/esp_radar"
 CORE="$(arduino-cli config get directories.data)/packages/esp32"
 # shellcheck disable=SC2012
 BOOTAPP0="$(ls "$CORE"/hardware/esp32/*/tools/partitions/boot_app0.bin | tail -1)"

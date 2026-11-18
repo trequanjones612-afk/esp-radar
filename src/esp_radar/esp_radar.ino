@@ -34,7 +34,7 @@
 #include "oui_table.h"
 #include "audit_defs.h"
 
-#define FW_VERSION "4.1.0"
+#define FW_VERSION "4.1.1"
 
 // ---------- Heltec WiFi LoRa 32 V4 pins (Heltec pins_arduino.h + Meshtastic variant) ----------
 static const int PIN_VEXT = 36;   // Vext power switch, ACTIVE LOW (powers the OLED)
@@ -554,15 +554,40 @@ static bool sameSubnet(const String &ipStr, uint8_t &last) {
 }
 // ======================= end v3 audit =======================
 
+static bool safeMode = false;
+static esp_reset_reason_t bootReason = ESP_RST_UNKNOWN;
+static bool crashReset(esp_reset_reason_t r) {
+  return r == ESP_RST_PANIC || r == ESP_RST_INT_WDT || r == ESP_RST_TASK_WDT || r == ESP_RST_WDT || r == ESP_RST_BROWNOUT;
+}
+static const char *rstName(esp_reset_reason_t r) {
+  switch (r) {
+    case ESP_RST_POWERON: return "POWERON";
+    case ESP_RST_EXT: return "EXT";
+    case ESP_RST_SW: return "SW";
+    case ESP_RST_PANIC: return "PANIC";
+    case ESP_RST_INT_WDT: return "INT_WDT";
+    case ESP_RST_TASK_WDT: return "TASK_WDT";
+    case ESP_RST_WDT: return "WDT";
+    case ESP_RST_DEEPSLEEP: return "DEEPSLEEP";
+    case ESP_RST_BROWNOUT: return "BROWNOUT";
+    case ESP_RST_SDIO: return "SDIO";
+    default: return "UNKNOWN";
+  }
+}
+
 #include "v4_presence.h"
 #include "v4_lights.h"
 
 static String fullState() {
   String s = stateJson();
   if (s.endsWith("}")) s.remove(s.length() - 1);
+  char h[96];
+  snprintf(h, sizeof h, ",\"rst\":\"%s\",\"heap\":%u,\"minHeap\":%u,\"safe\":%s",
+           rstName(bootReason), (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap(), safeMode ? "true" : "false");
   s += v4MotionSuffix();
   s += v4PresenceSuffix();
   s += v4LightsSuffix();
+  s += h;
   return s + "}";
 }
 
@@ -834,7 +859,9 @@ static void handleButton() {
 }
 
 void setup() {
+  bootReason = esp_reset_reason();
   Serial.begin(115200);
+  Serial.printf("# reset %s\n", rstName(bootReason));
   pinMode(PIN_PRG, INPUT_PULLUP);
   pinMode(PIN_LED, OUTPUT); digitalWrite(PIN_LED, LOW);
   oledInit();
@@ -849,6 +876,7 @@ void setup() {
   v4LoadLinks();
   v4PresenceLoad();
   ltLoad();
+  v4LightsStart();
 
   uint8_t mac[6]; WiFi.macAddress(mac);
   v4SetSelf(mac);
@@ -942,8 +970,14 @@ void loop() {
 
   sampleTick(); scanTick(); devTick();
   v4PresenceTick();
-  v4LightsTick();
   if (now - lastDecay >= 20000) { lastDecay = now; v4DecayTalkers(); }
+  static uint32_t lastHealth = 0;
+  if (now - lastHealth >= 10000) {
+    lastHealth = now;
+    Serial.printf("# up=%lu rst=%s heap=%u min=%u safe=%d csi=%.0f\n",
+                  (unsigned long)(now / 1000), rstName(bootReason), (unsigned)ESP.getFreeHeap(),
+                  (unsigned)ESP.getMinFreeHeap(), safeMode ? 1 : 0, s.pps);
+  }
 
   if (now - lastFrame >= 50) { lastFrame = now; drawOled(); }
   if (now - lastSse >= 125) { lastSse = now; if (events.count()) events.send(fullState().c_str(), "state", now); }

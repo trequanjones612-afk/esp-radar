@@ -300,7 +300,8 @@ function beep(){try{audio=audio||new (window.AudioContext||window.webkitAudioCon
 function onState(d){
   S=d;lastMsg=Date.now();if(d.now!=null)boardOffset=Date.now()-d.now;
   $('dot').className='on';
-  $('net').innerHTML=(d.ip?d.ip+'<br>':'')+(d.sta?'esp-radar.local · v'+d.v:(d.setup?'setup mode':'joining WiFi…'));
+  $('net').innerHTML=(d.ip?d.ip+'<br>':'')+(d.sta?'esp-radar.local · v'+d.v:(d.setup?'setup mode':'joining WiFi…'))
+    + '<br>' + (d.rst||'?') + ' · ' + Math.round((d.heap||0)/1024) + 'k free · min ' + Math.round((d.minHeap||0)/1024) + 'k';
   const noCsi=d.sta&&!d.cal&&d.pps<5;
   const loud = !d.cal && d.loudm!=null && d.louds && d.louds!=='wait' && d.louds!=='off' && d.louds!=='low';
   const showM = loud ? d.loudm : d.m;
@@ -327,7 +328,8 @@ function onState(d){
   $('score').textContent=d.cal||!d.score?'--':d.score.toFixed(1)+'×';
   $('sensv').textContent='sensitivity '+d.sens;if(document.activeElement!==$('sens'))$('sens').value=d.sens;
   const b=$('banner');
-  if(d.setup){b.style.display='block';b.innerHTML='Setup mode: <a href="/setup">connect the board to your home WiFi</a> — sensing needs a router link.';}
+  if(d.safe){b.style.display='block';b.textContent='Safe mode: the last boot was a crash ('+(d.rst||'')+'), so Beta lights stayed off. Turn Beta on again when you want them.';}
+  else if(d.setup){b.style.display='block';b.innerHTML='Setup mode: <a href="/setup">connect the board to your home WiFi</a> — sensing needs a router link.';}
   else if(d.sta&&!d.cal&&d.pps<20){b.style.display='block';b.textContent=`Only ${Math.round(d.pps)} CSI frames/s from your router (want 50+). Readings are unreliable — move the board closer to the router, or check the router isn't blocking ping.`;}
   else b.style.display='none';
   hist.push({t:Date.now(),m:d.cal?0:showM});while(hist.length&&hist[0].t<Date.now()-HIST_S*1000)hist.shift();

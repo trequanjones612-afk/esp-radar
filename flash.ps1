@@ -2,7 +2,8 @@
 #   irm https://raw.githubusercontent.com/trequanjones612-afk/esp-radar/main/flash.ps1 | iex
 # Options (set before running):
 #   $env:ESP_RADAR_PORT = "COM5"   use this port instead of auto-detecting
-#   $env:ESP_RADAR_ERASE = "1"     erase the whole flash first (recommended when coming from Meshtastic)
+#   $env:ESP_RADAR_ERASE = "1"     erase the whole flash first (wipes saved WiFi; recommended when coming from Meshtastic)
+# By default the NVS partition (saved WiFi + settings) is NOT written, so updates keep your settings.
 #   $env:ESP_RADAR_DRY_RUN = "1"   do everything except writing to the board
 # No admin rights needed. Everything lives in %LOCALAPPDATA%\esp-radar.
 # Written as one function so a failure never closes your PowerShell window.
@@ -88,6 +89,12 @@ function Install-EspRadar {
   $got = (Get-FileHash -ErrorAction Stop -Algorithm SHA256 -Path $Bin).Hash.ToLower()
   if ($got -ne $want) { throw "Checksum mismatch (expected $want, got $got)." }
   Say ("Firmware OK: {0} bytes, sha256 {1}..." -f $bytes.Length, $got.Substring(0, 16))
+  # Split the merged image so the NVS partition (0x9000-0xDFFF: saved WiFi + settings) is never written:
+  #   part 1 = 0x0000-0x8FFF (bootloader + partition table), part 2 = 0xE000-end (otadata + app)
+  if ($bytes.Length -le 0xE000) { throw 'Firmware image is too small.' }
+  $P1 = Join-Path $Dir 'part-0x0000.bin'; $P2 = Join-Path $Dir 'part-0xe000.bin'
+  $a = New-Object byte[] 0x9000; [Array]::Copy($bytes, 0, $a, 0, 0x9000); [IO.File]::WriteAllBytes($P1, $a)
+  $b = New-Object byte[] ($bytes.Length - 0xE000); [Array]::Copy($bytes, 0xE000, $b, 0, $b.Length); [IO.File]::WriteAllBytes($P2, $b)
 
   # ---- 4. serial port ----
   $Port = $env:ESP_RADAR_PORT
@@ -127,7 +134,7 @@ function Install-EspRadar {
   if ($Dry) {
     Say 'DRY RUN - would run:'
     if ($env:ESP_RADAR_ERASE -eq '1') { Write-Host "   $($Esptool -join ' ') --chip esp32s3 --port $Port erase_flash" }
-    Write-Host "   $($Esptool -join ' ') --chip esp32s3 --port $Port --baud 921600 write_flash 0x0 `"$Bin`""
+    Write-Host "   $($Esptool -join ' ') --chip esp32s3 --port $Port --baud 921600 write_flash 0x0 `"$P1`" 0xe000 `"$P2`""
     return
   }
   if ($env:ESP_RADAR_ERASE -eq '1') {
@@ -135,23 +142,24 @@ function Install-EspRadar {
     & $etExe @etPre --chip esp32s3 --port $Port erase_flash
     if ($LASTEXITCODE -ne 0) { throw 'Erase failed. Hold PRG, tap RST, release PRG, then run again.' }
   }
+  if ($env:ESP_RADAR_ERASE -eq '1') { Say 'Flash erased: saved WiFi settings are gone, you will get setup mode.' }
+  else { Say 'Keeping your saved WiFi + settings (NVS at 0x9000 is not touched).' }
   Say 'Flashing (about 20 s)...'
-  & $etExe @etPre --chip esp32s3 --port $Port --baud 921600 write_flash 0x0 $Bin
+  & $etExe @etPre --chip esp32s3 --port $Port --baud 921600 write_flash 0x0 $P1 0xe000 $P2
   if ($LASTEXITCODE -ne 0) {
     Warn 'Flash failed. Retrying at 115200 baud...'
-    & $etExe @etPre --chip esp32s3 --port $Port --baud 115200 write_flash 0x0 $Bin
+    & $etExe @etPre --chip esp32s3 --port $Port --baud 115200 write_flash 0x0 $P1 0xe000 $P2
     if ($LASTEXITCODE -ne 0) { throw 'Still failing. Put the board in download mode: hold PRG, tap RST, release PRG - then run again. Close any serial monitor (Arduino IDE, etc.) that holds the port.' }
   }
 
   Write-Host @'
 
-  ESP Radar is flashed! Next steps:
-    1. The OLED shows "SETUP MODE". On your phone, join WiFi  ESP-Radar-XXXX
-       (password: espradar).
-    2. Open  http://192.168.4.1  and pick your home 2.4 GHz WiFi + password.
-    3. The board restarts, joins your WiFi and calibrates for ~10 s - keep the room still.
-    4. Open the radar at  http://esp-radar.local  (or the IP on the OLED),
-       or keep using http://192.168.4.1 on the ESP-Radar network.
+  ESP Radar v2 is flashed! Next steps:
+    * Already set up before? It rejoins your WiFi by itself - open http://esp-radar.local
+      (or the IP on the OLED). Keep the room still for the 10 s calibration.
+    * New board / erased: the OLED shows "SETUP MODE". On your phone join WiFi
+      ESP-Radar-XXXX (password: espradar), open  http://192.168.71.1  and pick your
+      home 2.4 GHz WiFi. (v2 moved the setup AP from 192.168.4.1 to 192.168.71.1.)
     Short-press PRG = recalibrate  -  hold PRG 3 s = forget WiFi.
 '@ -ForegroundColor Green
 }

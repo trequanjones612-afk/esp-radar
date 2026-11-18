@@ -1,0 +1,444 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#010a03">
+<title>ESP Radar</title>
+<style>
+:root{--g:#39ff7a;--gd:#0f7a35;--gl:#b6ffcf;--bg:#010a03;--amber:#ffcc33;--red:#ff4d4d;--lime:#c8ff3a}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{background:var(--bg);color:var(--g);font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;min-height:100%;overflow-x:hidden}
+body{background:radial-gradient(ellipse at 50% 20%,#03200c 0%,#010a03 60%,#000 100%);min-height:100vh;padding-bottom:70px}
+body:after{content:"";position:fixed;inset:0;pointer-events:none;background:repeating-linear-gradient(0deg,rgba(0,0,0,.16) 0 1px,transparent 1px 3px);mix-blend-mode:multiply;z-index:9}
+header{display:flex;align-items:center;justify-content:space-between;padding:10px 14px 4px;letter-spacing:.18em;font-size:13px}
+header b{font-size:16px;text-shadow:0 0 8px var(--g)}
+#dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:var(--red);margin-right:6px;box-shadow:0 0 8px currentColor}
+#dot.on{background:var(--g)}
+#net{font-size:10px;opacity:.75;text-align:right;max-width:55%}
+nav{position:fixed;left:0;right:0;bottom:0;display:flex;background:rgba(0,16,5,.95);border-top:1px solid rgba(57,255,122,.35);z-index:10;padding-bottom:env(safe-area-inset-bottom)}
+nav button{flex:1;border:0;border-radius:0;background:none;padding:12px 0 10px;font-size:11px;letter-spacing:.12em;color:rgba(57,255,122,.6)}
+nav button i{display:block;font-style:normal;font-size:18px;margin-bottom:2px}
+nav button.on{color:var(--g);text-shadow:0 0 8px var(--g);background:rgba(57,255,122,.08)}
+main{max-width:620px;margin:0 auto;padding:0 12px 24px}
+section{display:none}section.on{display:block}
+.card{border:1px solid rgba(57,255,122,.35);border-radius:12px;background:rgba(0,30,8,.55);padding:10px 12px;margin-top:12px;box-shadow:inset 0 0 22px rgba(57,255,122,.07)}
+.card h3{font-size:11px;letter-spacing:.22em;opacity:.85;margin-bottom:6px;font-weight:600;display:flex;justify-content:space-between;gap:8px}
+#wrap{position:relative;width:100%;aspect-ratio:1/1;max-width:440px;margin:4px auto 0}
+canvas{display:block;width:100%}
+#meter{height:100%}
+#hud{position:absolute;left:0;right:0;top:50%;transform:translateY(-50%);text-align:center;pointer-events:none}
+#pct{font-size:clamp(40px,13vw,66px);font-weight:700;text-shadow:0 0 14px var(--g),0 0 2px #fff}
+#state{display:inline-block;margin-top:2px;padding:3px 12px;border:1px solid var(--g);border-radius:20px;font-size:12px;letter-spacing:.22em;background:rgba(0,40,10,.6)}
+#state.motion{color:#021;background:var(--g);box-shadow:0 0 18px var(--g)}
+#state.cal{color:var(--amber);border-color:var(--amber)}
+#state.bad{color:var(--red);border-color:var(--red)}
+.cap{text-align:center;font-size:11px;opacity:.6;margin-top:4px}
+#graph{height:100px}#acts{height:90px}
+.row{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;text-align:center}
+.stat small{display:block;font-size:10px;opacity:.6;letter-spacing:.12em}
+.stat span{font-size:16px;text-shadow:0 0 6px var(--g)}
+.stat span.bad{color:var(--red);text-shadow:none}.stat span.warn{color:var(--amber);text-shadow:none}
+ul.log{list-style:none;max-height:190px;overflow:auto;font-size:13px}
+ul.log li{padding:5px 0;border-bottom:1px dashed rgba(57,255,122,.15);display:flex;justify-content:space-between;gap:8px}
+ul.log li.s{color:var(--gl)} ul.log li.e{opacity:.65}
+.controls{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+button,.btn{font:inherit;color:var(--g);background:rgba(0,50,15,.7);border:1px solid var(--g);border-radius:9px;padding:8px 11px;font-size:12px;letter-spacing:.06em;cursor:pointer;text-decoration:none;display:inline-block}
+button:active,button.on{background:var(--g);color:#021;box-shadow:0 0 12px var(--g)}
+button:disabled{opacity:.4}
+input[type=range]{flex:1;accent-color:var(--g);min-width:120px}
+select,input[type=text]{font:inherit;font-size:13px;background:#001505;color:var(--gl);border:1px solid var(--g);border-radius:8px;padding:6px}
+.note{font-size:11px;opacity:.65;line-height:1.5;margin-top:10px}
+.banner{display:none;margin-top:10px;padding:8px 10px;border:1px solid var(--amber);color:var(--amber);border-radius:10px;font-size:12px}
+a{color:var(--gl)}
+#plan{touch-action:none;border-radius:8px;background:#000d04}
+.legend{display:flex;flex-wrap:wrap;gap:10px;font-size:11px;margin-top:8px}
+.legend span:before{content:"";display:inline-block;width:12px;height:12px;border-radius:3px;margin-right:5px;vertical-align:-2px;background:var(--c)}
+.tbl{width:100%;border-collapse:collapse;font-size:12px}
+.tbl td{padding:6px 4px;border-bottom:1px dashed rgba(57,255,122,.15);vertical-align:top}
+.tbl td small{display:block;opacity:.55;font-size:10px}
+.bar{height:6px;border-radius:3px;background:rgba(57,255,122,.15);margin-top:4px;overflow:hidden}.bar i{display:block;height:100%;background:var(--g)}
+.tag{display:inline-block;font-size:9px;letter-spacing:.12em;padding:1px 6px;border-radius:8px;border:1px solid currentColor;margin-left:4px;vertical-align:1px}
+.tag.new{color:#021;background:var(--amber);border-color:var(--amber);box-shadow:0 0 10px var(--amber)}
+#chan{height:150px}
+.big{font-size:20px;text-shadow:0 0 8px var(--g)}
+.prog{height:4px;background:rgba(57,255,122,.15);border-radius:2px;margin-top:6px}.prog i{display:block;height:100%;width:0;background:var(--g);box-shadow:0 0 8px var(--g);transition:width .3s}
+.hint{font-size:12px;color:var(--gl);margin-top:6px;min-height:16px}
+</style></head>
+<body>
+<header><div><span id="dot"></span><b>ESP&nbsp;RADAR</b></div><div id="net">connecting…</div></header>
+<main>
+<!-- ============ MOTION ============ -->
+<section id="t-motion" class="on">
+  <div id="wrap"><canvas id="meter"></canvas>
+    <div id="hud"><div id="pct">--%</div><div id="state">LINK</div></div>
+  </div>
+  <p class="cap">Motion intensity from WiFi signal fluctuation — it has no direction or location.</p>
+  <div class="banner" id="banner"></div>
+  <div class="card"><h3><span>MOTION · LAST 60 s</span><span>threshold 25%</span></h3><canvas id="graph"></canvas></div>
+  <div class="card"><div class="row">
+    <div class="stat"><small>CSI/S</small><span id="pps">--</span></div>
+    <div class="stat"><small>PING OK/S</small><span id="ping">--</span></div>
+    <div class="stat"><small>RSSI</small><span id="rssi">--</span></div>
+    <div class="stat"><small>VS BASELINE</small><span id="score">--</span></div>
+  </div></div>
+  <div class="card"><h3><span>ROOM ACTIVITY · LAST HOUR</span><span id="actinfo">per minute</span></h3><canvas id="acts"></canvas></div>
+  <div class="card"><h3><span>EVENT LOG</span><span id="evc">0</span></h3><ul class="log" id="log"><li class="e"><span>no motion events yet</span></li></ul></div>
+  <div class="card"><h3><span>CONTROLS</span><span id="sensv">sensitivity 5</span></h3>
+    <div class="controls">
+      <button id="alert">🔔 ALERTS OFF</button>
+      <button id="recal">⟲ RECALIBRATE</button>
+      <a class="btn" href="/setup">WIFI SETUP</a>
+    </div>
+    <div class="controls" style="margin-top:10px"><small style="opacity:.7">SENSITIVITY</small><input id="sens" type="range" min="1" max="10" value="5"></div>
+    <p class="note">Recalibrate with the room empty and still (10 s). Sensitivity is saved on the board.</p>
+  </div>
+  <p class="note">How it works: the board measures 51 WiFi subcarriers of every frame your router sends it (~50+ per second) and compares how much they fluctuate against the quiet-room baseline. "VS BASELINE" 1.0× = like the empty room. Moving people, pets or fans raise it. It cannot see, count, or locate anyone.</p>
+</section>
+
+<!-- ============ COVERAGE ============ -->
+<section id="t-cov">
+  <div class="card"><h3><span>WIFI COVERAGE MAP</span><span id="covinfo">0 points</span></h3>
+    <div class="controls">
+      <button data-mode="draw" class="mode">▭ ROOMS</button>
+      <button data-mode="survey" class="mode on">📍 SURVEY</button>
+      <button id="imgbtn">🖼 PLAN IMAGE</button>
+      <button id="undo">↶ UNDO</button>
+      <button id="clear">🗑 CLEAR</button>
+    </div>
+    <div class="hint" id="covhint">Tap where you are standing to take a reading.</div>
+    <canvas id="plan" style="margin-top:8px"></canvas>
+    <div class="legend">
+      <span style="--c:#39ff7a">excellent &gt; −55</span><span style="--c:#c8ff3a">good −55…−67</span>
+      <span style="--c:#ffcc33">fair −67…−75</span><span style="--c:#ff4d4d">poor &lt; −75 dBm</span>
+    </div>
+    <div class="controls" style="margin-top:10px">
+      <small style="opacity:.7">HEATMAP OF</small><select id="layer"><option value="">connected AP</option></select>
+      <label style="font-size:12px"><input type="checkbox" id="scanall"> scan all APs per point</label>
+    </div>
+    <div class="controls" style="margin-top:10px">
+      <button id="expjson">⤓ JSON</button><button id="impjson">⤒ IMPORT</button><button id="exppng">⤓ PNG</button>
+      <input type="file" id="imgfile" accept="image/*" hidden><input type="file" id="jsonfile" accept=".json,application/json" hidden>
+    </div>
+  </div>
+  <div class="card"><h3><span>HOW TO SURVEY</span></h3>
+    <p class="note" style="margin-top:0">1. Draw your rooms (▭ ROOMS: drag a rectangle, then name it) or load a photo of a floor plan (🖼).<br>
+    2. Power the board from a USB power bank and carry it with your phone (phone on the same home WiFi).<br>
+    3. In 📍 SURVEY, stand still, tap your spot on the plan: the board averages 10 RSSI readings (~1.5 s).<br>
+    4. Cover each room; the map interpolates between points (IDW) and fades out where there is no data.<br>
+    Plan + points are saved in this browser only (not on the board). The ESP32-S3 is <b>2.4 GHz only</b> — this maps 2.4 GHz coverage, not 5 GHz/6 GHz.</p>
+  </div>
+</section>
+
+<!-- ============ NETWORKS ============ -->
+<section id="t-net">
+  <div class="card"><h3><span>2.4 GHz CHANNELS</span><span id="netage"></span></h3>
+    <canvas id="chan"></canvas>
+    <p class="big" id="rec" style="margin-top:8px">scan to get a recommendation</p>
+    <p class="note" id="recwhy"></p>
+    <div class="controls" style="margin-top:8px"><button id="rescan">⟳ SCAN</button></div>
+  </div>
+  <div class="card"><h3><span>NETWORKS NEARBY</span><span id="netcount"></span></h3><table class="tbl" id="nets"></table></div>
+  <p class="note">The ESP32-S3 radio is 2.4 GHz only: 5 GHz / 6 GHz networks are not visible here. A scan briefly pauses motion sensing.</p>
+</section>
+
+<!-- ============ DEVICES ============ -->
+<section id="t-dev">
+  <div class="card"><h3><span>DEVICES ON YOUR LAN</span><span id="devsub"></span></h3>
+    <div class="controls"><button id="devscan">⟳ SCAN NETWORK</button><span id="devstat" style="font-size:12px;opacity:.75"></span></div>
+    <div class="prog"><i id="devprog"></i></div>
+  </div>
+  <div class="card"><h3><span>FOUND</span><span id="devcount"></span></h3><table class="tbl" id="devs"><tr><td>Tap SCAN NETWORK (takes ~15 s).</td></tr></table></div>
+  <p class="note">ARP sweep of your home /24 from the board. Vendor comes from the MAC prefix (a built-in table of common brands); phones usually use a <i>private (randomized) MAC</i> per network, so they show no vendor. Names come from NetBIOS when a device answers. Devices that sleep or ignore ARP may be missed. <b>Only scan networks you own or are allowed to scan.</b></p>
+</section>
+</main>
+<nav>
+  <button data-t="motion" class="on"><i>◉</i>MOTION</button>
+  <button data-t="cov"><i>▦</i>COVERAGE</button>
+  <button data-t="net"><i>≋</i>NETWORKS</button>
+  <button data-t="dev"><i>⌂</i>DEVICES</button>
+</nav>
+<script>
+(()=>{
+const $=id=>document.getElementById(id);
+const post=(u,b)=>fetch(u,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:b||''});
+const dpr=()=>devicePixelRatio||1;
+function fit(c,h){const r=c.getBoundingClientRect();c.width=Math.max(1,r.width*dpr());c.height=(h||r.height)*dpr();}
+const fmtT=d=>d.toLocaleTimeString([],{hour:'numeric',minute:'2-digit'});
+const fmtTs=d=>d.toLocaleTimeString([],{hour:'numeric',minute:'2-digit',second:'2-digit'});
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+let S={m:0,s:'link',cal:false,cp:0,rssi:0,pps:0,ping:0,score:0,sens:5,up:0,now:0},lastMsg=0,boardOffset=null;
+// board uptime ms -> phone wall clock
+const bTime=ms=>new Date((boardOffset??Date.now())+ms);
+
+// ---------------- tabs ----------------
+let tab='motion';
+document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{
+  tab=b.dataset.t;document.querySelectorAll('nav button').forEach(x=>x.classList.toggle('on',x===b));
+  document.querySelectorAll('section').forEach(s=>s.classList.toggle('on',s.id==='t-'+tab));
+  if(tab==='cov')layoutPlan(); if(tab==='net'&&!nets.length)scanNets(false); if(tab==='dev')loadDevs();
+  location.hash=tab;scrollTo(0,0);
+});
+if(location.hash.length>1){const b=document.querySelector(`nav button[data-t="${location.hash.slice(1)}"]`);if(b)setTimeout(()=>b.click(),0);}
+
+// ---------------- MOTION ----------------
+const mc=$('meter'),mx=mc.getContext('2d'),gc=$('graph'),gx=gc.getContext('2d'),ac=$('acts'),ax=ac.getContext('2d');
+const hist=[];const HIST_S=60;let evs=[],alerts=false,audio=null,prevState=null,peak=0,ripples=[],ripT=0,lvlDisp=0;
+function resizeAll(){fit(mc);fit(gc);fit(ac);if(typeof drawAct==='function')drawAct();if(tab==='cov')layoutPlan();if(tab==='net'&&nets.length)drawChan();}
+addEventListener('resize',resizeAll);resizeAll();
+function renderLog(){
+  $('evc').textContent=evs.length;
+  $('log').innerHTML=evs.length?evs.slice(0,40).map(e=>`<li class="${e.start?'s':'e'}"><span>${e.start?'▲ motion started':'▼ motion ended'}</span><span>${fmtTs(e.when)}${!e.start&&e.peak?` · peak ${e.peak}%`:''}${!e.start&&e.dur?` · ${Math.round(e.dur/1000)} s`:''}</span></li>`).join(''):'<li class="e"><span>no motion events yet</span></li>';
+}
+function addEv(e){evs.push(e);evs.sort((a,b)=>b.when-a.when);renderLog();}
+function beep(){try{audio=audio||new (window.AudioContext||window.webkitAudioContext)();const o=audio.createOscillator(),g=audio.createGain();
+  o.type='square';o.frequency.value=880;g.gain.setValueAtTime(.08,audio.currentTime);g.gain.exponentialRampToValueAtTime(.001,audio.currentTime+.35);
+  o.connect(g).connect(audio.destination);o.start();o.stop(audio.currentTime+.36);}catch(e){}}
+function onState(d){
+  S=d;lastMsg=Date.now();if(d.now!=null)boardOffset=Date.now()-d.now;
+  $('dot').className='on';
+  $('net').innerHTML=(d.ip?d.ip+'<br>':'')+(d.sta?'esp-radar.local · v'+d.v:(d.setup?'setup mode':'joining WiFi…'));
+  const noCsi=d.sta&&!d.cal&&d.pps<5;
+  $('pct').textContent=d.cal?Math.round(d.cp*100)+'%':(noCsi?'--':Math.round(d.m)+'%');
+  const se=$('state');
+  se.className=d.cal?'cal':(noCsi?'bad':(d.s==='motion'?'motion':''));
+  se.textContent=!d.sta?'NO WIFI LINK':d.cal?'CALIBRATING · KEEP STILL':noCsi?'NO CSI DATA':(d.s==='motion'?'MOTION':'STILL');
+  const pe=$('pps');pe.textContent=Math.round(d.pps);pe.className=d.pps<20?'bad':(d.pps<40?'warn':'');
+  $('ping').textContent=Math.round(d.ping);$('rssi').textContent=d.sta?Math.round(d.rssi)+'':'--';
+  $('score').textContent=d.cal||!d.score?'--':d.score.toFixed(1)+'×';
+  $('sensv').textContent='sensitivity '+d.sens;if(document.activeElement!==$('sens'))$('sens').value=d.sens;
+  const b=$('banner');
+  if(d.setup){b.style.display='block';b.innerHTML='Setup mode: <a href="/setup">connect the board to your home WiFi</a> — sensing needs a router link.';}
+  else if(d.sta&&!d.cal&&d.pps<20){b.style.display='block';b.textContent=`Only ${Math.round(d.pps)} CSI frames/s from your router (want 50+). Readings are unreliable — move the board closer to the router, or check the router isn't blocking ping.`;}
+  else b.style.display='none';
+  hist.push({t:Date.now(),m:d.cal?0:d.m});while(hist.length&&hist[0].t<Date.now()-HIST_S*1000)hist.shift();
+  if(!d.cal){
+    if(d.s==='motion')peak=Math.max(peak,Math.round(d.m));
+    if(prevState!==null&&d.s!==prevState){
+      if(d.s==='motion'){addEv({start:true,when:new Date()});if(alerts){navigator.vibrate&&navigator.vibrate([180,80,180]);beep();}}
+      else if(prevState==='motion'){addEv({start:false,peak,when:new Date()});peak=0;}
+    }
+    prevState=d.s;
+  }
+}
+fetch('/api/events').then(r=>r.json()).then(j=>{const base=Date.now()-j.now;for(const e of j.ev)evs.push({start:e.start,peak:e.peak,dur:e.dur,when:new Date(base+e.t)});evs.sort((a,b)=>b.when-a.when);renderLog();}).catch(()=>{});
+let poll=null;
+function startPoll(){if(poll)return;poll=setInterval(()=>fetch('/api/state').then(r=>r.json()).then(onState).catch(()=>{}),250);}
+try{const es=new EventSource('/events');es.addEventListener('state',e=>{try{onState(JSON.parse(e.data))}catch(_){}});es.onerror=()=>setTimeout(()=>{if(Date.now()-lastMsg>2500)startPoll()},2600);}catch(e){startPoll();}
+setInterval(()=>{if(Date.now()-lastMsg>3000){$('dot').className='';$('state').textContent='LINK LOST';}},1000);
+$('alert').onclick=()=>{alerts=!alerts;const a=$('alert');a.classList.toggle('on',alerts);a.textContent=alerts?'🔔 ALERTS ON':'🔔 ALERTS OFF';if(alerts){beep();navigator.vibrate&&navigator.vibrate(60);}};
+$('recal').onclick=()=>post('/api/recal');
+$('sens').onchange=e=>post('/api/sens','v='+e.target.value);
+
+function drawMeter(dt){
+  const W=mc.width,H=mc.height,R=Math.min(W,H)/2*0.92,d=dpr();
+  const target=S.cal||(S.sta&&S.pps<5)?0:S.m;lvlDisp+=(target-lvlDisp)*Math.min(1,dt*6);
+  const lvl=lvlDisp;
+  mx.clearRect(0,0,W,H);mx.save();mx.translate(W/2,H/2);
+  // 10 concentric rings: ring k lights when level >= 10k (inner = low, outer = high)
+  for(let k=1;k<=10;k++){const r=R*(0.18+0.082*k),lit=lvl>=k*10-5,partial=Math.max(0,Math.min(1,(lvl-(k-1)*10)/10));
+    const col=k>6?'255,107,77':(k>3?'255,204,51':'57,255,122');
+    mx.strokeStyle=`rgba(${lit||partial>0?col:'57,255,122'},${lit?0.85:(0.1+partial*0.6)})`;
+    mx.lineWidth=(lit?3:1.5)*d;mx.shadowColor=`rgb(${col})`;mx.shadowBlur=lit?12*d:0;
+    mx.beginPath();mx.arc(0,0,r,0,7);mx.stroke();}
+  mx.shadowBlur=0;
+  // pulses: emitted at a rate set by the real motion level (none when still)
+  ripT+=dt*(lvl/100)*4;
+  while(ripT>=1){ripT-=1;ripples.push({r:R*0.12,a:Math.min(1,0.3+lvl/100)});}
+  ripples=ripples.filter(p=>p.a>0.02&&p.r<R*1.02);
+  for(const p of ripples){p.r+=dt*R*0.55;p.a*=Math.pow(0.35,dt);mx.strokeStyle=`rgba(182,255,207,${p.a})`;mx.lineWidth=2*d;mx.beginPath();mx.arc(0,0,p.r,0,7);mx.stroke();}
+  // threshold ring (25%)
+  mx.setLineDash([4*d,6*d]);mx.strokeStyle='rgba(255,204,51,.55)';mx.lineWidth=1*d;mx.beginPath();mx.arc(0,0,R*(0.18+0.082*2.5),0,7);mx.stroke();mx.setLineDash([]);
+  // rim gauge
+  mx.lineWidth=7*d;mx.lineCap='round';mx.strokeStyle='rgba(57,255,122,0.12)';mx.beginPath();mx.arc(0,0,R+4*d,Math.PI*0.75,Math.PI*2.25);mx.stroke();
+  const v=S.cal?S.cp*100:lvl,col=v>60&&!S.cal?'#ff6b4d':(v>25&&!S.cal?'#ffcc33':'#39ff7a');
+  mx.strokeStyle=col;mx.shadowColor=col;mx.shadowBlur=12*d;mx.beginPath();mx.arc(0,0,R+4*d,Math.PI*0.75,Math.PI*(0.75+1.5*Math.max(0.004,v/100)));mx.stroke();mx.shadowBlur=0;
+  mx.restore();
+}
+function drawGraph(){
+  const W=gc.width,H=gc.height,d=dpr(),now=Date.now();
+  gx.clearRect(0,0,W,H);gx.strokeStyle='rgba(57,255,122,0.12)';gx.lineWidth=1;
+  for(let i=1;i<4;i++){gx.beginPath();gx.moveTo(0,H*i/4);gx.lineTo(W,H*i/4);gx.stroke();}
+  const ty=H-H*0.25;gx.setLineDash([4*d,4*d]);gx.strokeStyle='rgba(255,204,51,0.6)';gx.beginPath();gx.moveTo(0,ty);gx.lineTo(W,ty);gx.stroke();gx.setLineDash([]);
+  if(hist.length<2)return;
+  const pts=hist.map(h=>[W-((now-h.t)/1000/HIST_S)*W,H-(h.m/100)*(H-4*d)-2*d]);
+  const g=gx.createLinearGradient(0,0,0,H);g.addColorStop(0,'rgba(57,255,122,0.5)');g.addColorStop(1,'rgba(57,255,122,0)');
+  gx.fillStyle=g;gx.beginPath();gx.moveTo(pts[0][0],H);for(const p of pts)gx.lineTo(p[0],p[1]);gx.lineTo(pts[pts.length-1][0],H);gx.closePath();gx.fill();
+  gx.strokeStyle='#39ff7a';gx.lineWidth=2*d;gx.beginPath();pts.forEach((p,i)=>i?gx.lineTo(p[0],p[1]):gx.moveTo(p[0],p[1]));gx.stroke();
+}
+var actData=null;
+function loadAct(){fetch('/api/activity').then(r=>r.json()).then(j=>{actData=j;drawAct();}).catch(()=>{});}
+function drawAct(){
+  const W=ac.width,H=ac.height,d=dpr();ax.clearRect(0,0,W,H);
+  const lab=14*d,bh=H-lab,bw=W/60;
+  ax.strokeStyle='rgba(57,255,122,0.12)';ax.beginPath();ax.moveTo(0,bh);ax.lineTo(W,bh);ax.stroke();
+  if(!actData)return;
+  const off=Date.now()-actData.now;const b=actData.b.concat([[actData.cur.avg,actData.cur.peak,actData.cur.mot]]);
+  const n=b.length;let busy=0;
+  b.forEach((v,i)=>{const x=W-(n-i)*bw;const h=Math.max(1*d,(v[0]/100)*(bh-2*d)),hp=(v[1]/100)*(bh-2*d);
+    ax.fillStyle='rgba(57,255,122,0.18)';ax.fillRect(x+1*d,bh-hp,bw-2*d,hp);
+    ax.fillStyle=v[2]>20?'#ffcc33':'#39ff7a';ax.fillRect(x+1*d,bh-h,bw-2*d,h);if(v[2]>20)busy++;});
+  ax.fillStyle='rgba(57,255,122,0.6)';ax.font=`${10*d}px monospace`;ax.textAlign='center';
+  for(let m=0;m<=60;m+=15){const x=W-m*bw-bw/2;const t=new Date(off+actData.minuteStart-m*60000);ax.fillText(m?fmtT(t):'now',Math.min(W-16*d,Math.max(16*d,x)),H-2*d);}
+  $('actinfo').textContent=`${n} min · ${busy} active`;
+}
+loadAct();setInterval(loadAct,20000);
+
+// ---------------- COVERAGE ----------------
+const pc=$('plan'),px=pc.getContext('2d');
+const KEY='espradar.coverage.v1';
+let plan={aspect:0.75,rooms:[],points:[],img:null};
+try{const s=localStorage.getItem(KEY);if(s)plan=Object.assign(plan,JSON.parse(s));}catch(e){}
+let img=null,mode='survey',drag=null,pending=null,undoStack=[];
+function save(){try{localStorage.setItem(KEY,JSON.stringify(plan));}catch(e){$('covhint').textContent='Browser storage is full — export JSON and use a smaller plan image.';}}
+function loadImg(){img=null;if(plan.img){const i=new Image();i.onload=()=>{img=i;drawPlan();};i.src=plan.img;}}
+loadImg();
+function layoutPlan(){const w=pc.getBoundingClientRect().width||pc.parentElement.clientWidth;pc.style.height=(w*plan.aspect)+'px';fit(pc,w*plan.aspect);drawPlan();}
+const GRID=24;
+function toN(e){const r=pc.getBoundingClientRect();return {x:Math.min(1,Math.max(0,(e.clientX-r.left)/r.width)),y:Math.min(1,Math.max(0,(e.clientY-r.top)/r.height))};}
+const snap=v=>Math.round(v*GRID)/GRID;
+function rssiColor(v,a){const stops=[[-85,[255,77,77]],[-75,[255,77,77]],[-71,[255,204,51]],[-67,[255,204,51]],[-61,[200,255,58]],[-55,[200,255,58]],[-50,[57,255,122]],[-30,[57,255,122]]];
+  v=Math.max(-85,Math.min(-30,v));for(let i=1;i<stops.length;i++){if(v<=stops[i][0]){const [a0,c0]=stops[i-1],[a1,c1]=stops[i],t=(v-a0)/(a1-a0||1);return `rgba(${c0.map((c,j)=>Math.round(c+(c1[j]-c)*t)).join(',')},${a})`;}}return `rgba(57,255,122,${a})`;}
+function layerVal(p){const L=$('layer').value;if(!L)return p.rssi;const ap=(p.aps||[]).find(a=>a.bssid===L);return ap?ap.rssi:null;}
+function drawPlan(){
+  const W=pc.width,H=pc.height,d=dpr();if(!W)return;
+  px.clearRect(0,0,W,H);px.fillStyle='#000d04';px.fillRect(0,0,W,H);
+  if(img){px.globalAlpha=0.55;px.drawImage(img,0,0,W,H);px.globalAlpha=1;}
+  px.strokeStyle='rgba(57,255,122,0.08)';px.lineWidth=1;
+  for(let i=1;i<GRID;i++){const x=i/GRID*W;px.beginPath();px.moveTo(x,0);px.lineTo(x,H);px.stroke();}
+  for(let i=1;i<GRID*plan.aspect;i++){const y=i/(GRID*plan.aspect)*H;px.beginPath();px.moveTo(0,y);px.lineTo(W,y);px.stroke();}
+  // heatmap (inverse-distance weighting on a coarse grid, faded where no point is near)
+  const pts=plan.points.map(p=>({x:p.x,y:p.y,v:layerVal(p)})).filter(p=>p.v!=null);
+  if(pts.length){
+    const gw=72,gh=Math.round(72*plan.aspect),cw=W/gw,ch=H/gh;
+    for(let j=0;j<gh;j++)for(let i=0;i<gw;i++){
+      const x=(i+.5)/gw,y=(j+.5)/gh*plan.aspect;let num=0,den=0,dmin=9;
+      for(const p of pts){const dx=x-p.x,dy=y-p.y*plan.aspect,dd=dx*dx+dy*dy;dmin=Math.min(dmin,dd);const w=1/(dd+1e-4);num+=w*p.v;den+=w;}
+      const reach=Math.sqrt(dmin),a=Math.max(0,0.62*(1-reach/0.28));
+      if(a>0.01){px.fillStyle=rssiColor(num/den,a);px.fillRect(i*cw,j*ch,cw+1,ch+1);}
+    }
+  }
+  // rooms
+  px.font=`${11*d}px monospace`;px.textAlign='center';px.textBaseline='middle';
+  for(const r of plan.rooms){px.strokeStyle='rgba(182,255,207,0.9)';px.lineWidth=2*d;px.strokeRect(r.x*W,r.y*H,r.w*W,r.h*H);
+    if(r.label){px.fillStyle='rgba(0,13,4,.7)';const tw=px.measureText(r.label).width+8*d;px.fillRect(r.x*W+r.w*W/2-tw/2,r.y*H+r.h*H/2-8*d,tw,16*d);px.fillStyle='#b6ffcf';px.fillText(r.label,r.x*W+r.w*W/2,r.y*H+r.h*H/2);}}
+  if(drag&&mode==='draw'){const x=Math.min(drag.a.x,drag.b.x),y=Math.min(drag.a.y,drag.b.y);px.setLineDash([5*d,4*d]);px.strokeStyle='#ffcc33';px.strokeRect(x*W,y*H,Math.abs(drag.a.x-drag.b.x)*W,Math.abs(drag.a.y-drag.b.y)*H);px.setLineDash([]);}
+  // points
+  px.font=`bold ${8.5*d}px monospace`;
+  for(const p of plan.points){const v=layerVal(p);px.fillStyle=v==null?'#555':rssiColor(v,1);px.strokeStyle='#000';px.lineWidth=2*d;
+    px.beginPath();px.arc(p.x*W,p.y*H,10*d,0,7);px.fill();px.stroke();
+    px.fillStyle='#000';px.fillText(v==null?'–':Math.round(v),p.x*W,p.y*H+0.5*d);}
+  if(pending){px.strokeStyle='#fff';px.lineWidth=2*d;const t=performance.now()/200;px.beginPath();px.arc(pending.x*W,pending.y*H,(9+3*Math.sin(t))*d,0,7);px.stroke();}
+  const ok=plan.points.length;const vals=plan.points.map(layerVal).filter(v=>v!=null);
+  $('covinfo').textContent=ok?(vals.length?`${ok} pts · ${Math.round(Math.max(...vals))}…${Math.round(Math.min(...vals))} dBm`:`${ok} pts`):'0 points';
+}
+function setMode(m){mode=m;document.querySelectorAll('.mode').forEach(b=>b.classList.toggle('on',b.dataset.mode===m));
+  $('covhint').textContent=m==='draw'?'Drag to draw a room, then name it.':'Stand still and tap where you are to take a reading.';}
+document.querySelectorAll('.mode').forEach(b=>b.onclick=()=>setMode(b.dataset.mode));
+pc.addEventListener('pointerdown',e=>{const p=toN(e);if(mode==='draw'){drag={a:{x:snap(p.x),y:snap(p.y)},b:{x:snap(p.x),y:snap(p.y)}};pc.setPointerCapture(e.pointerId);}});
+pc.addEventListener('pointermove',e=>{if(drag){const p=toN(e);drag.b={x:snap(p.x),y:snap(p.y)};drawPlan();}});
+pc.addEventListener('pointerup',e=>{
+  const p=toN(e);
+  if(mode==='draw'&&drag){const r={x:Math.min(drag.a.x,drag.b.x),y:Math.min(drag.a.y,drag.b.y),w:Math.abs(drag.a.x-drag.b.x),h:Math.abs(drag.a.y-drag.b.y)};drag=null;
+    if(r.w>0.02&&r.h>0.02){r.label=(prompt('Room name?','')||'').slice(0,24);plan.rooms.push(r);undoStack.push('room');save();}drawPlan();return;}
+  if(mode==='survey')takeSample(p);
+});
+async function takeSample(p){
+  if(pending)return;pending=p;const anim=setInterval(drawPlan,60);
+  const hint=$('covhint');hint.textContent='Measuring… hold still (~1.5 s)';
+  try{
+    const r=await post('/api/sample','n=10');if(!r.ok)throw new Error((await r.json()).error||'board busy');
+    const id=(await r.json()).id;let j;
+    for(let i=0;i<40;i++){await new Promise(z=>setTimeout(z,200));j=await (await fetch('/api/sample')).json();if(j.id===id&&!j.busy)break;}
+    if(!j||j.busy||j.avg==null)throw new Error('no reading');
+    const pt={x:p.x,y:p.y,rssi:j.avg,min:j.min,max:j.max,sd:j.sd,n:j.n,bssid:j.bssid,ch:j.ch,t:Date.now()};
+    if($('scanall').checked){hint.textContent='Scanning all access points… (~3 s)';
+      await fetch('/api/scan?force=1');let s;for(let i=0;i<30;i++){await new Promise(z=>setTimeout(z,400));s=await (await fetch('/api/scan')).json();if(!s.scanning)break;}
+      if(s&&s.nets)pt.aps=s.nets.map(n=>({ssid:n.ssid,bssid:n.bssid,ch:n.ch,rssi:n.rssi}));refreshLayers();}
+    plan.points.push(pt);undoStack.push('point');save();
+    hint.textContent=`${Math.round(j.avg)} dBm (min ${j.min}, max ${j.max}, ±${j.sd}) — tap the next spot.`;
+  }catch(e){hint.textContent='Reading failed: '+e.message+'. Is the board on your home WiFi?';}
+  clearInterval(anim);pending=null;drawPlan();
+}
+function refreshLayers(){const sel=$('layer'),cur=sel.value,seen={};
+  for(const p of plan.points)for(const a of (p.aps||[]))seen[a.bssid]=a;
+  sel.innerHTML='<option value="">connected AP</option>'+Object.values(seen).sort((a,b)=>(a.ssid||'').localeCompare(b.ssid||'')).map(a=>`<option value="${a.bssid}">${esc(a.ssid||'(hidden)')} · ch${a.ch} · ${a.bssid.slice(-5)}</option>`).join('');sel.value=cur;}
+refreshLayers();$('layer').onchange=drawPlan;
+$('undo').onclick=()=>{const k=undoStack.pop()||(plan.points.length?'point':'room');if(k==='point')plan.points.pop();else plan.rooms.pop();save();drawPlan();};
+$('clear').onclick=()=>{if(confirm('Clear all rooms, points and the plan image?')){plan={aspect:0.75,rooms:[],points:[],img:null};img=null;undoStack=[];save();refreshLayers();layoutPlan();}};
+$('imgbtn').onclick=()=>$('imgfile').click();
+$('imgfile').onchange=e=>{const f=e.target.files[0];if(!f)return;const i=new Image();i.onload=()=>{
+  const sc=Math.min(1,1400/Math.max(i.width,i.height)),c=document.createElement('canvas');c.width=i.width*sc;c.height=i.height*sc;c.getContext('2d').drawImage(i,0,0,c.width,c.height);
+  plan.img=c.toDataURL('image/jpeg',0.8);plan.aspect=c.height/c.width;save();loadImg();layoutPlan();URL.revokeObjectURL(i.src);};i.src=URL.createObjectURL(f);e.target.value='';};
+function download(name,url){const a=document.createElement('a');a.href=url;a.download=name;document.body.appendChild(a);a.click();a.remove();}
+$('expjson').onclick=()=>download('esp-radar-coverage.json',URL.createObjectURL(new Blob([JSON.stringify(plan,null,1)],{type:'application/json'})));
+$('impjson').onclick=()=>$('jsonfile').click();
+$('jsonfile').onchange=e=>{const f=e.target.files[0];if(!f)return;f.text().then(t=>{const j=JSON.parse(t);if(!Array.isArray(j.points))throw 0;plan=Object.assign({aspect:0.75,rooms:[],points:[],img:null},j);save();loadImg();refreshLayers();layoutPlan();}).catch(()=>alert('Not an ESP Radar coverage file.'));e.target.value='';};
+$('exppng').onclick=()=>{const W=pc.width,H=pc.height,d=dpr(),c=document.createElement('canvas');c.width=W;c.height=H+44*d;const x=c.getContext('2d');
+  x.fillStyle='#000d04';x.fillRect(0,0,c.width,c.height);x.drawImage(pc,0,0);x.font=`${11*d}px monospace`;x.textBaseline='middle';
+  [['#39ff7a','> -55'],['#c8ff3a','-55..-67'],['#ffcc33','-67..-75'],['#ff4d4d','< -75 dBm']].forEach(([c2,t],i)=>{x.fillStyle=c2;x.fillRect(8*d+i*W/4,H+12*d,12*d,12*d);x.fillStyle='#b6ffcf';x.fillText(t,24*d+i*W/4,H+18*d);});
+  x.fillStyle='rgba(182,255,207,.6)';x.fillText('ESP Radar 2.4 GHz coverage · '+new Date().toLocaleString(),8*d,H+34*d);
+  download('esp-radar-coverage.png',c.toDataURL('image/png'));};
+
+// ---------------- NETWORKS ----------------
+var nets=[],myBssid='';const cc=$('chan'),cx2=cc.getContext('2d');
+async function scanNets(force){
+  $('rescan').disabled=true;$('rec').textContent='scanning…';
+  try{let j=await (await fetch('/api/scan'+(force?'?force=1':''))).json();
+    for(let i=0;i<30&&j.scanning;i++){await new Promise(z=>setTimeout(z,500));j=await (await fetch('/api/scan')).json();}
+    nets=j.nets||[];myBssid=j.bssid||'';renderNets();$('netage').textContent='updated '+fmtTs(new Date());
+  }catch(e){$('rec').textContent='scan failed';}
+  $('rescan').disabled=false;
+}
+$('rescan').onclick=()=>scanNets(true);
+const overlap=dch=>[1,.7,.4,.15,0][Math.min(4,Math.abs(dch))];
+const weight=r=>Math.max(0.05,Math.min(1,(r+95)/45));
+function renderNets(){
+  const sorted=nets.slice().sort((a,b)=>b.rssi-a.rssi);
+  $('netcount').textContent=sorted.length+' found';
+  $('nets').innerHTML=sorted.map(n=>`<tr><td><b>${esc(n.ssid||'(hidden)')}</b>${n.bssid===myBssid?'<span class="tag">CONNECTED</span>':''}<small>${n.bssid}</small></td><td>ch ${n.ch}<small>${n.auth}</small></td><td style="width:34%">${n.rssi} dBm<div class="bar"><i style="width:${Math.round(weight(n.rssi)*100)}%;background:${rssiColor(n.rssi,1)}"></i></div></td></tr>`).join('')||'<tr><td>No 2.4 GHz networks found.</td></tr>';
+  // congestion per channel (excluding your own AP), recommend 1/6/11
+  const others=nets.filter(n=>n.bssid!==myBssid&&n.ch>=1&&n.ch<=14);
+  const score=c=>others.reduce((s,n)=>s+weight(n.rssi)*overlap(n.ch-c),0);
+  const rec=[1,6,11].map(c=>({c,s:score(c)})).sort((a,b)=>a.s-b.s);
+  const mine=nets.find(n=>n.bssid===myBssid);
+  $('rec').textContent=nets.length?`Least crowded: channel ${rec[0].c}`:'no data';
+  $('recwhy').textContent=nets.length?`Congestion score (other networks, weighted by signal & overlap): `+[1,6,11].map(c=>`ch${c} ${score(c).toFixed(1)}`).join(' · ')+(mine?`. Your router is on ch${mine.ch}${[1,6,11].includes(mine.ch)?'':' (not 1/6/11 — overlaps two channels)'}${mine.ch===rec[0].c?' — already the best choice.':'.'}`:''):'';
+  drawChan();
+}
+function drawChan(){
+  fit(cc);const W=cc.width,H=cc.height,d=dpr(),L=26*d,B=16*d,cw=(W-L-6*d)/14;cx2.clearRect(0,0,W,H);
+  const X=ch=>L+(ch-0.5)*cw,Y=r=>H-B-((Math.max(-95,Math.min(-30,r))+95)/65)*(H-B-6*d);
+  cx2.font=`${9*d}px monospace`;cx2.fillStyle='rgba(57,255,122,.6)';cx2.textAlign='center';
+  for(let c=1;c<=13;c++){cx2.fillStyle=[1,6,11].includes(c)?'#b6ffcf':'rgba(57,255,122,.5)';cx2.fillText(c,X(c),H-4*d);}
+  cx2.textAlign='right';cx2.fillStyle='rgba(57,255,122,.5)';
+  for(const r of [-40,-60,-80]){cx2.fillText(r,L-4*d,Y(r)+3*d);cx2.strokeStyle='rgba(57,255,122,.1)';cx2.beginPath();cx2.moveTo(L,Y(r));cx2.lineTo(W,Y(r));cx2.stroke();}
+  for(const n of nets.slice().sort((a,b)=>a.rssi-b.rssi)){if(n.ch<1||n.ch>14)continue;
+    const mine=n.bssid===myBssid,col=mine?'#ffffff':rssiColor(n.rssi,1);
+    cx2.beginPath();cx2.moveTo(X(n.ch-2),Y(-95));cx2.bezierCurveTo(X(n.ch-1.6),Y(n.rssi)-(H*0.05),X(n.ch+1.6),Y(n.rssi)-(H*0.05),X(n.ch+2),Y(-95));
+    cx2.fillStyle=col.replace(',1)',',.12)').replace('#ffffff','rgba(255,255,255,.15)');cx2.fill();cx2.strokeStyle=col;cx2.lineWidth=(mine?2.5:1.3)*d;cx2.stroke();
+    if(n.rssi>-80||mine){cx2.fillStyle=col;cx2.textAlign='center';cx2.fillText((n.ssid||'hidden').slice(0,10),X(n.ch),Y(n.rssi)-4*d);}}
+}
+
+// ---------------- DEVICES ----------------
+let devTimer=null;
+async function loadDevs(){
+  try{const j=await (await fetch('/api/devices')).json();const off=Date.now()-j.now;
+    $('devsub').textContent=j.subnet||'';$('devprog').style.width=(j.scanning?j.progress:(j.d.length?100:0))+'%';
+    $('devstat').textContent=j.scanning?`scanning… ${j.progress}%`:(j.done?`last scan ${fmtT(new Date(off+j.done))}`:'');
+    $('devscan').disabled=j.scanning;
+    const ipn=s=>+s.split('.')[3];
+    const list=j.d.slice().sort((a,b)=>(b.new-a.new)||ipn(a.ip)-ipn(b.ip));
+    $('devcount').textContent=list.length+' devices'+(list.some(x=>x.new)?` · ${list.filter(x=>x.new).length} new`:'');
+    if(list.length)$('devs').innerHTML=list.map(x=>`<tr><td><b>${esc(x.name||x.vendor||'Unknown device')}</b>${x.role?`<span class="tag">${x.role.toUpperCase()}</span>`:''}${x.new?'<span class="tag new">NEW</span>':''}<small>${x.name&&x.vendor?esc(x.vendor):''}</small></td><td>${x.ip}<small>${x.mac}</small></td><td style="text-align:right"><small>first ${fmtT(new Date(off+x.first))}</small><small>last ${fmtT(new Date(off+x.last))}</small></td></tr>`).join('');
+    clearTimeout(devTimer);if(j.scanning&&tab==='dev')devTimer=setTimeout(loadDevs,800);
+  }catch(e){$('devstat').textContent='board unreachable';}
+}
+$('devscan').onclick=async()=>{const r=await post('/api/devices/scan');if(!r.ok){$('devstat').textContent='needs a home WiFi connection';return;}setTimeout(loadDevs,300);};
+
+// ---------------- render loop ----------------
+let prevT=performance.now();
+function frame(t){const dt=Math.min(.1,(t-prevT)/1000);prevT=t;if(tab==='motion'){drawMeter(dt);drawGraph();}requestAnimationFrame(frame);}
+requestAnimationFrame(frame);
+})();
+</script>
+</body></html>

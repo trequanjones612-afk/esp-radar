@@ -5,6 +5,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiClient.h>
+#include <lwip/sockets.h>
 #include <mbedtls/aes.h>
 #include <mbedtls/md.h>
 #include <mbedtls/gcm.h>
@@ -125,13 +126,19 @@ static bool gcmDecrypt(const uint8_t key[16], const uint8_t *iv, const uint8_t *
   return rc == 0;
 }
 
+static void tcpAbort(WiFiClient &c) {
+  struct linger ling = {1, 0};          // RST instead of a 60 s TIME_WAIT on the 16-socket lwIP pool
+  c.setSocketOption(SOL_SOCKET, SO_LINGER, &ling, sizeof ling);
+  c.stop();
+}
+
 static int tcpReadSome(WiFiClient &c, uint8_t *buf, int cap, uint32_t ms) {
   uint32_t t = millis();
   int n = 0;
   while ((int32_t)(millis() - t) < (int32_t)ms && n < cap) {
     while (c.available() && n < cap) buf[n++] = (uint8_t)c.read();
     if (n >= 20) break;
-    delay(8);
+    vTaskDelay(pdMS_TO_TICKS(5));   // worker task only; never call this from loop()
   }
   return n;
 }
@@ -139,7 +146,7 @@ static int tcpReadSome(WiFiClient &c, uint8_t *buf, int cap, uint32_t ms) {
 static bool tcpExchange(WiFiClient &c, const uint8_t *msg, int n, uint8_t *rx, int rxCap, int &rxN) {
   if (!c.connected()) return false;
   c.write(msg, n);
-  rxN = tcpReadSome(c, rx, rxCap, 350);
+  rxN = tcpReadSome(c, rx, rxCap, 120);
   return rxN >= 16;
 }
 
@@ -258,14 +265,14 @@ static bool tuyaControl(const IPAddress &ip, const char *devId, const char *key,
   tuyaKey16(key, real);
   WiFiClient c;
   c.setTimeout(2);
-  if (!c.connect(ip, 6668, 800)) { memset(real, 0, sizeof real); return false; }
+  if (!c.connect(ip, 6668, 200)) { memset(real, 0, sizeof real); return false; }
   uint32_t seq = 1;
   uint8_t session[16];
   memcpy(session, real, 16);
   bool ok = true;
   if (ver >= 35) ok = negotiate35(c, real, session, seq);
   else if (ver >= 34) ok = negotiate34(c, real, session, seq);
-  if (!ok) { c.stop(); memset(real, 0, sizeof real); memset(session, 0, sizeof session); return false; }
+  if (!ok) { tcpAbort(c); memset(real, 0, sizeof real); memset(session, 0, sizeof session); return false; }
   bool answered = false;
   for (int alt = 0; alt < 2 && !answered; alt++) {
     char js[200];
@@ -292,7 +299,7 @@ static bool tuyaControl(const IPAddress &ip, const char *devId, const char *key,
       if (framed) answered = true;
     }
   }
-  c.stop();
+  tcpAbort(c);
   memset(real, 0, sizeof real);
   memset(session, 0, sizeof session);
   return answered;
@@ -302,12 +309,12 @@ static bool tuyaControl(const IPAddress &ip, const char *devId, const char *key,
 static int tuyaPortProbe(const IPAddress &ip) {
   WiFiClient c;
   c.setTimeout(1);
-  if (!c.connect(ip, 6668, 160)) return 0;
+  if (!c.connect(ip, 6668, 80)) return 0;
   uint8_t frame[32], rx[80];
   int n = frame55(frame, sizeof frame, 1, 0x09, nullptr, 0, false, nullptr, 0);
   int rn = 0;
   bool framed = n > 0 && tcpExchange(c, frame, n, rx, sizeof rx, rn) && rn >= 4 &&
                 (memcmp(rx, TUYA_PREFIX, 4) == 0 || memcmp(rx, TUYA35_PREFIX, 4) == 0);
-  c.stop();
+  tcpAbort(c);
   return framed ? 2 : 1;
 }

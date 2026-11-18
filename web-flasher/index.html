@@ -41,7 +41,7 @@ const st = document.getElementById('st');
     // Two parts that skip the NVS partition (0x9000-0xDFFF) so an update keeps saved WiFi settings
     // (unless you tick "Erase device" in the install dialog).
     const blob = b => URL.createObjectURL(new Blob([b], { type: 'application/octet-stream' }));
-    const manifest = { name: 'ESP Radar', version: '4.1.0', new_install_prompt_erase: true,
+    const manifest = { name: 'ESP Radar', version: '4.1.1', new_install_prompt_erase: true,
       builds: [{ chipFamily: 'ESP32-S3', parts: [
         { path: blob(bin.slice(0, 0x9000)), offset: 0 },
         { path: blob(bin.slice(0xE000)), offset: 0xE000 }] }] };

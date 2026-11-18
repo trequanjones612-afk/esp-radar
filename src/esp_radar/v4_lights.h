@@ -76,6 +76,7 @@ static int ltN = 0;
 static Rule rules[RULE_MAX];
 static bool betaOn = false;
 static bool ltSocks = false;
+static bool tuyaBound = false;
 static uint32_t ltScanAt = 0;
 static uint8_t ltSeq = 1;
 static WiFiUDP gUdp, wUdp, lUdp, tUdp6, tUdp7;
@@ -88,6 +89,10 @@ static int bleQ = -1;
 static bool bleQOn = false;
 static uint8_t bleQBri = 80;
 static bool bleScanReq = false;
+struct LanCmd { int8_t i; uint8_t on; uint8_t bri; };
+static LanCmd lanQ[8];
+static uint8_t lanQn = 0;
+static portMUX_TYPE lanMux = portMUX_INITIALIZER_UNLOCKED;
 static uint8_t scanOct[254];
 static int scanN = 0, scanUdp = 0, scanTcp = 0;
 static uint32_t nextUdp = 0, nextTcp = 0;
@@ -211,6 +216,18 @@ static void ltLoad() {
   if (p.getBytesLength("tuya") == sizeof tuyaKeys) p.getBytes("tuya", tuyaKeys, sizeof tuyaKeys);
   p.end();
   for (int i = 0; i < TUYA_KEYS; i++) tuyaKeys[i].id[sizeof tuyaKeys[i].id - 1] = tuyaKeys[i].key[16] = 0;
+  // v4.1.0 ran Beta work on loop() and could wedge WiFi without the task WDT firing
+  // (select/delay feed the idle watchdog). A panic or watchdog on the next boot
+  // means that session died; do not bring Beta back up until the user turns it on.
+  if (betaOn && crashReset(bootReason)) {
+    betaOn = false;
+    safeMode = true;
+    Preferences w;
+    w.begin("espradar-v4", false);
+    w.putUChar("beta", 0);
+    w.end();
+    Serial.printf("# safe mode: last reset %s, Beta forced off\n", rstName(bootReason));
+  }
 }
 
 static int ltFind(const char *id) {
@@ -265,7 +282,6 @@ static void lifxHdr(uint8_t *p, uint16_t size, uint16_t type, bool tagged) {
 static bool ltEnsure() {
   if (ltSocks) return true;
   bool ok = gUdp.begin(4002) && wUdp.begin(38899) && lUdp.begin(56700);
-  if (ok) { tUdp6.begin(6666); tUdp7.begin(6667); }
   ltSocks = ok;
   if (!ok) Serial.println("# lights: UDP bind failed");
   return ok;
@@ -316,12 +332,8 @@ static void broadcastScan() {
   if (udpSend(lUdp, IPAddress(255, 255, 255, 255), 56700, pkt, 36)) diag.lSent++;
 }
 
-static void lightSet(int i, bool on, int bri) {
-  if (i < 0 || i >= ltN) return;
+static void lanSend(int i, bool on, int bri) {
   IPAddress ip(lts[i].ip[0], lts[i].ip[1], lts[i].ip[2], lts[i].ip[3]);
-  if (!onLan(ip)) return;
-  if (bri < 1) bri = 1;
-  if (bri > 100) bri = 100;
   char buf[160];
   if (lts[i].brand == BR_GOVEE) {
     snprintf(buf, sizeof buf, "{\"msg\":{\"cmd\":\"turn\",\"data\":{\"value\":%d}}}", on ? 1 : 0);
@@ -341,7 +353,37 @@ static void lightSet(int i, bool on, int bri) {
     pkt[36] = level & 0xff;
     pkt[37] = level >> 8;
     udpSend(lUdp, ip, 56700, pkt, 42);
-  } else if (lts[i].brand == BR_TUYA) {
+  }
+  lts[i].on = on ? 1 : 0;
+  if (on) lts[i].bri = (uint8_t)bri;
+  Serial.printf("# light %s %s bri=%d brand=%u\n", lts[i].name, on ? "on" : "off", bri, lts[i].brand);
+}
+
+static void lanFlush() {
+  LanCmd batch[8];
+  uint8_t n;
+  portENTER_CRITICAL(&lanMux);
+  n = lanQn;
+  if (n > 8) n = 8;
+  memcpy(batch, lanQ, n * sizeof(LanCmd));
+  lanQn = 0;
+  portEXIT_CRITICAL(&lanMux);
+  for (uint8_t k = 0; k < n; k++) lanSend(batch[k].i, batch[k].on, batch[k].bri);
+}
+
+static void lightSet(int i, bool on, int bri) {
+  if (i < 0 || i >= ltN) return;
+  IPAddress ip(lts[i].ip[0], lts[i].ip[1], lts[i].ip[2], lts[i].ip[3]);
+  if (lts[i].brand != BR_GOVEE_BLE && !onLan(ip)) return;
+  if (bri < 1) bri = 1;
+  if (bri > 100) bri = 100;
+  if (lts[i].brand == BR_GOVEE || lts[i].brand == BR_WIZ || lts[i].brand == BR_LIFX) {
+    portENTER_CRITICAL(&lanMux);
+    if (lanQn < 8) lanQ[lanQn++] = LanCmd{(int8_t)i, (uint8_t)(on ? 1 : 0), (uint8_t)bri};
+    portEXIT_CRITICAL(&lanMux);
+    return;
+  }
+  if (lts[i].brand == BR_TUYA) {
     qIdx = i; qOn = on; qBri = (uint8_t)bri;
     return;
   } else if (lts[i].brand == BR_GOVEE_BLE) {
@@ -491,8 +533,12 @@ static void rememberOct(uint8_t oct, uint8_t *seen) {
   scanOct[scanN++] = oct;
 }
 
-static void v4LightScan(bool whole) {
-  if (!betaOn || !staUp || !ltEnsure()) return;
+static bool scanPending = false;
+static bool scanWholeReq = false;
+static bool manualPending = false;
+static IPAddress manualIp;
+
+static void startScan(bool whole) {
   memset(&diag, 0, sizeof diag);
   diag.scanning = true;
   diag.whole = whole;
@@ -507,14 +553,27 @@ static void v4LightScan(bool whole) {
   }
   diag.hosts = (uint16_t)scanN;
   strncpy(diag.phase, scanN ? "broadcast" : "no hosts", sizeof diag.phase - 1);
+  if (!tuyaBound) { tUdp6.begin(6666); tUdp7.begin(6667); tuyaBound = true; }
   broadcastScan();
   nextUdp = millis();
   nextTcp = millis() + 40;
   Serial.printf("# light scan %s, %d hosts (unicast; broadcast kept too)\n", whole ? "whole /24" : "device list", scanN);
 }
 
+static void v4LightScan(bool whole) {
+  if (!betaOn) return;
+  scanWholeReq = whole;
+  scanPending = true;
+}
+
 static void v4LightManual(const IPAddress &ip) {
-  if (!onLan(ip) || !ltEnsure()) return;
+  if (!onLan(ip)) return;
+  manualIp = ip;
+  manualPending = true;
+}
+
+static void doManual() {
+  IPAddress ip = manualIp;
   probeHost(ip);
   char id[28];
   snprintf(id, sizeof id, "ip-%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
@@ -575,7 +634,7 @@ static void scanPump() {
     snprintf(diag.phase, sizeof diag.phase, "unicast %d/%d", scanUdp, scanN);
   }
   if (scanTcp < scanN && now >= nextTcp) {
-    nextTcp = now + 280;
+    nextTcp = now + 350;                 // one TCP socket, then a gap so lwIP can drain
     IPAddress ip(me[0], me[1], me[2], scanOct[scanTcp]);
     int hit = tuyaPortProbe(ip);
     if (hit) {
@@ -588,6 +647,7 @@ static void scanPump() {
   if (scanUdp >= scanN && scanTcp >= scanN) {
     diag.scanning = false;
     strncpy(diag.phase, "done", sizeof diag.phase - 1);
+    if (tuyaBound) { tUdp6.stop(); tUdp7.stop(); tuyaBound = false; }
     if (lightsDirty) ltSave();
     Serial.printf("# light scan done govee %u/%u wiz %u/%u lifx %u/%u tuya heard %u open %u framed %u\n",
                   diag.gRx, diag.gSent, diag.wRx, diag.wSent, diag.lRx, diag.lSent, diag.tHeard, diag.tOpen, diag.tFrame);
@@ -653,15 +713,21 @@ static void tuyaPump() {
   Serial.printf("# tuya %s %s ver=%d reply=%s\n", lts[i].name, qOn ? "on" : "off", ver, ok ? "yes" : "no");
 }
 
-static void v4LightsTick() {
+static TaskHandle_t ltTaskHandle = nullptr;
+
+// Runs on its own task. loop() must not call this: connect/select/BLE block the caller.
+static void v4LightsWorker() {
   if (!betaOn || !staUp) return;
   if (!ltEnsure()) return;
+  if (scanPending) { scanPending = false; startScan(scanWholeReq); }
+  if (manualPending) { manualPending = false; doManual(); }
+  lanFlush();
   uint32_t now = millis();
   ltPoll();
-  tuyaUdpPoll(tUdp6);
-  tuyaUdpPoll(tUdp7);
+  if (tuyaBound) { tuyaUdpPoll(tUdp6); tuyaUdpPoll(tUdp7); }
   if (bleScanReq || bleQ >= 0) goveeBlePump();
-  else { scanPump(); tuyaPump(); }
+  else if (qIdx >= 0) tuyaPump();
+  else scanPump();
   if (!diag.scanning && now - ltScanAt > 25000) {
     ltScanAt = now;
     broadcastScan();
@@ -709,17 +775,27 @@ static void v4LightsTick() {
   }
 }
 
+static void ltTask(void *) {
+  for (;;) {
+    v4LightsWorker();
+    vTaskDelay(pdMS_TO_TICKS(15));
+  }
+}
+static void v4LightsStart() {
+  if (ltTaskHandle) return;
+  xTaskCreatePinnedToCore(ltTask, "lights", 12288, nullptr, 1, &ltTaskHandle, 1);
+}
+
 static void v4SetBeta(bool on) {
   betaOn = on;
   ltSave();
-  if (on && staUp) { ltEnsure(); ltScanAt = 0; }
+  if (on) ltScanAt = 0;
   Serial.printf("# lights beta %s\n", on ? "ON" : "off");
 }
 static bool v4Beta() { return betaOn; }
 
 static bool v4LightTest(const char *id, const char *op, int bri) {
   if (!betaOn) return false;
-  if (!ltEnsure()) return false;
   if (op && !strcmp(op, "offall")) {
     for (int i = 0; i < ltN; i++) lightSet(i, false, 1);
     return true;

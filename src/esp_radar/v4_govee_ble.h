@@ -99,11 +99,22 @@ class GoveeScanCb : public BLEAdvertisedDeviceCallbacks {
 };
 static GoveeScanCb goveeScanCb;
 
+static void goveeBleShutdown() {
+  if (goveeClient && goveeClient->isConnected()) goveeClient->disconnect();
+  goveeClient = nullptr;                 // BLEDevice::deinit deletes its client object
+  if (goveeBleReady) {
+    BLEDevice::deinit(true);             // release the controller so WiFi/CSI get the radio back
+    goveeBleReady = false;
+    Serial.println("# govee BLE deinit");
+  }
+  goveeBleScanning = false;
+}
+
 static bool goveeBleInit() {
   if (goveeBleReady) return true;
   if (!BLEDevice::init("esp-radar")) return false;
   goveeBleReady = true;
-  Serial.println("# govee BLE inited (NimBLE on this ESP32-S3 core). Idle: no scan, no connection.");
+  Serial.println("# govee BLE init (only for this scan or write)");
   return true;
 }
 
@@ -128,6 +139,7 @@ static int goveeBleScan(uint32_t seconds) {
   int n = 0;
   for (int i = 0; i < goveeHitN; i++) if (goveeHits[i].used) n++;
   Serial.printf("# govee BLE scan done, %d bulb(s). Not a CSI measurement.\n", n);
+  goveeBleShutdown();
   return n;
 }
 
@@ -145,12 +157,13 @@ static void goveePacket(uint8_t pkt[20], uint8_t cmd, uint8_t a, uint8_t b = 0) 
 static bool goveeBleWrite(const char *mac, uint8_t addrType, bool on, int briPct) {
   if (!mac || !mac[0] || !goveeBleInit()) return false;
   if (!goveeClient) goveeClient = BLEDevice::createClient();
-  if (!goveeClient) return false;
+  if (!goveeClient) { goveeBleShutdown(); return false; }
   if (goveeClient->isConnected()) goveeClient->disconnect();
   BLEAddress addr(String(mac), addrType);
-  if (!goveeClient->connect(addr, addrType, 4000)) {
-    if (addrType == BLE_ADDR_PUBLIC && !goveeClient->connect(BLEAddress(String(mac), BLE_ADDR_RANDOM), BLE_ADDR_RANDOM, 3000)) {
+  if (!goveeClient->connect(addr, addrType, 2500)) {
+    if (addrType != BLE_ADDR_PUBLIC || !goveeClient->connect(BLEAddress(String(mac), BLE_ADDR_RANDOM), BLE_ADDR_RANDOM, 2000)) {
       Serial.printf("# govee BLE %s no connect\n", mac);
+      goveeBleShutdown();
       return false;
     }
   }
@@ -175,12 +188,13 @@ static bool goveeBleWrite(const char *mac, uint8_t addrType, bool on, int briPct
       int bri = constrain(briPct, 1, 100);
       uint8_t level = (uint8_t)((bri * 255) / 100);
       if (!level) level = 1;
-      delay(40);
+      vTaskDelay(pdMS_TO_TICKS(40));
       goveePacket(pkt, 0x04, level);
       ok = ch->writeValue(pkt, 20, false);
     }
   }
-  goveeClient->disconnect();
+  if (goveeClient->isConnected()) goveeClient->disconnect();
   Serial.printf("# govee BLE %s %s bri=%d write=%s\n", mac, on ? "on" : "off", briPct, ok ? "ok" : "fail");
+  goveeBleShutdown();
   return ok;
 }

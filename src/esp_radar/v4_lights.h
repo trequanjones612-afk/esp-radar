@@ -71,16 +71,17 @@ struct __attribute__((packed)) RuleSave {
   uint8_t nId, timeoutMin, flags, bri;
 };
 
-static Light lts[LT_MAX];
+static Light *lts = nullptr;
 static int ltN = 0;
-static Rule rules[RULE_MAX];
+static Rule *rules = nullptr;
 static bool betaOn = false;
 static bool ltSocks = false;
 static bool tuyaBound = false;
 static uint32_t ltScanAt = 0;
 static uint8_t ltSeq = 1;
 static WiFiUDP gUdp, wUdp, lUdp, tUdp6, tUdp7;
-static TuyaSec tuyaKeys[TUYA_KEYS];
+static TuyaSec *tuyaKeys = nullptr;
+static const size_t TUYA_BYTES = sizeof(TuyaSec) * TUYA_KEYS;
 static bool lightsDirty = false;
 static int qIdx = -1;
 static bool qOn = false;
@@ -140,10 +141,12 @@ static bool onLan(const IPAddress &ip) {
   return ip[0] == me[0] && ip[1] == me[1] && ip[2] == me[2] && ip[3] > 0 && ip[3] < 255 && ip != me;
 }
 
+static bool ltAlloc();
+static void ltRead(Preferences &p);
 static void ltSave() {
   RuleSave s[RULE_MAX];
   memset(s, 0, sizeof s);
-  for (int i = 0; i < RULE_MAX; i++) {
+  if (rules) for (int i = 0; i < RULE_MAX; i++) {
     s[i].used = rules[i].used;
     s[i].link = rules[i].link;
     memcpy(s[i].room, rules[i].room, sizeof s[i].room);
@@ -156,29 +159,29 @@ static void ltSave() {
   Preferences p;
   p.begin("espradar-v4", false);
   p.putUChar("beta", betaOn ? 1 : 0);
-  p.putBytes("rules", s, sizeof s);
-  static LightSave ls[LT_MAX];
-  memset(ls, 0, sizeof ls);
+  if (rules) p.putBytes("rules", s, sizeof s);
+  LightSave *ls = lts ? (LightSave *)psAlloc(sizeof(LightSave) * LT_MAX, "light-save") : nullptr;
   int n = ltN;
   if (n > LT_MAX) n = LT_MAX;
-  for (int i = 0; i < n; i++) {
-    ls[i].brand = lts[i].brand;
-    memcpy(ls[i].ip, lts[i].ip, 4);
-    ls[i].flags = lts[i].flags;
-    memcpy(ls[i].id, lts[i].id, sizeof ls[i].id);
-    memcpy(ls[i].name, lts[i].name, sizeof ls[i].name);
-    memcpy(ls[i].model, lts[i].model, sizeof ls[i].model);
+  if (ls) {
+    for (int i = 0; i < n; i++) {
+      ls[i].brand = lts[i].brand;
+      memcpy(ls[i].ip, lts[i].ip, 4);
+      ls[i].flags = lts[i].flags;
+      memcpy(ls[i].id, lts[i].id, sizeof ls[i].id);
+      memcpy(ls[i].name, lts[i].name, sizeof ls[i].name);
+      memcpy(ls[i].model, lts[i].model, sizeof ls[i].model);
+    }
+    p.putUChar("ln", (uint8_t)n);
+    p.putBytes("lights", ls, n * sizeof(LightSave));
+    free(ls);
   }
-  p.putUChar("ln", (uint8_t)n);
-  p.putBytes("lights", ls, n * sizeof(LightSave));
-  p.putBytes("tuya", tuyaKeys, sizeof tuyaKeys);
+  if (tuyaKeys) p.putBytes("tuya", tuyaKeys, TUYA_BYTES);
   p.end();
   lightsDirty = false;
 }
-static void ltLoad() {
-  Preferences p;
-  p.begin("espradar-v4", true);
-  betaOn = p.getUChar("beta", 0) != 0;
+static void ltRead(Preferences &p) {
+  if (!lts || !rules) return;
   RuleSave s[RULE_MAX];
   memset(s, 0, sizeof s);
   if (p.getBytesLength("rules") == sizeof s) p.getBytes("rules", s, sizeof s);
@@ -195,9 +198,9 @@ static void ltLoad() {
   }
   int n = p.getUChar("ln", 0);
   if (n > LT_MAX) n = LT_MAX;
-  if (n && p.getBytesLength("lights") >= (size_t)n * sizeof(LightSave)) {
-    static LightSave ls[LT_MAX];
-    memset(ls, 0, sizeof ls);
+  if (n && lts && p.getBytesLength("lights") >= (size_t)n * sizeof(LightSave)) {
+    LightSave *ls = (LightSave *)psAlloc(sizeof(LightSave) * LT_MAX, "light-load");
+    if (!ls) return;
     p.getBytes("lights", ls, n * sizeof(LightSave));
     ltN = n;
     for (int i = 0; i < n; i++) {
@@ -212,14 +215,18 @@ static void ltLoad() {
       lts[i].name[sizeof lts[i].name - 1] = 0;
       lts[i].seen = 1;
     }
+    free(ls);
   }
-  if (p.getBytesLength("tuya") == sizeof tuyaKeys) p.getBytes("tuya", tuyaKeys, sizeof tuyaKeys);
-  p.end();
-  for (int i = 0; i < TUYA_KEYS; i++) tuyaKeys[i].id[sizeof tuyaKeys[i].id - 1] = tuyaKeys[i].key[16] = 0;
-  // v4.1.0 ran Beta work on loop() and could wedge WiFi without the task WDT firing
-  // (select/delay feed the idle watchdog). A panic or watchdog on the next boot
-  // means that session died; do not bring Beta back up until the user turns it on.
+  if (tuyaKeys && p.getBytesLength("tuya") == TUYA_BYTES) p.getBytes("tuya", tuyaKeys, TUYA_BYTES);
+  if (tuyaKeys) for (int i = 0; i < TUYA_KEYS; i++) tuyaKeys[i].id[sizeof tuyaKeys[i].id - 1] = tuyaKeys[i].key[16] = 0;
+}
+
+static void ltLoad() {
+  Preferences p;
+  p.begin("espradar-v4", true);
+  betaOn = p.getUChar("beta", 0) != 0;
   if (betaOn && crashReset(bootReason)) {
+    p.end();
     betaOn = false;
     safeMode = true;
     Preferences w;
@@ -227,16 +234,21 @@ static void ltLoad() {
     w.putUChar("beta", 0);
     w.end();
     Serial.printf("# safe mode: last reset %s, Beta forced off\n", rstName(bootReason));
+    return;
   }
+  if (!betaOn) { p.end(); return; }
+  if (!ltAlloc()) { p.end(); betaOn = false; Serial.println("# beta left off: no memory for light tables"); return; }
+  ltRead(p);
+  p.end();
 }
 
 static int ltFind(const char *id) {
-  if (!id || !id[0]) return -1;
+  if (!lts || !id || !id[0]) return -1;
   for (int i = 0; i < ltN; i++) if (!strcmp(lts[i].id, id)) return i;
   return -1;
 }
 static int ltUpsert(uint8_t brand, const IPAddress &ip, const char *id, const char *name, const char *model) {
-  if (!id || !id[0]) return -1;
+  if (!lts || !id || !id[0]) return -1;
   if (brand != BR_GOVEE_BLE && !onLan(ip)) return -1;
   int i = ltFind(id);
   if (i < 0) {
@@ -287,7 +299,27 @@ static bool ltEnsure() {
   return ok;
 }
 
+static bool ltAlloc() {
+  if (!lts) lts = (Light *)psAlloc(sizeof(Light) * LT_MAX, "lights");
+  if (!rules) rules = (Rule *)psAlloc(sizeof(Rule) * RULE_MAX, "rules");
+  if (!tuyaKeys) tuyaKeys = (TuyaSec *)psAlloc(TUYA_BYTES, "tuya-keys");
+  goveeBleStorage();
+  return lts && rules && tuyaKeys;
+}
+static void ltStopSockets() {
+  if (ltSocks) { gUdp.stop(); wUdp.stop(); lUdp.stop(); ltSocks = false; }
+  if (tuyaBound) { tUdp6.stop(); tUdp7.stop(); tuyaBound = false; }
+}
+static void ltFree() {
+  ltStopSockets();
+  free(lts); lts = nullptr; ltN = 0;
+  free(rules); rules = nullptr;
+  if (tuyaKeys) { memset(tuyaKeys, 0, TUYA_BYTES); free(tuyaKeys); tuyaKeys = nullptr; }
+  goveeBleStorageFree();
+}
+
 static int tuyaSlot(const char *id) {
+  if (!tuyaKeys) return -1;
   if (!id || !id[0]) return -1;
   int freeSlot = -1;
   for (int i = 0; i < TUYA_KEYS; i++) {
@@ -717,7 +749,7 @@ static TaskHandle_t ltTaskHandle = nullptr;
 
 // Runs on its own task. loop() must not call this: connect/select/BLE block the caller.
 static void v4LightsWorker() {
-  if (!betaOn || !staUp) return;
+  if (!betaOn || !staUp || !lts) return;
   if (!ltEnsure()) return;
   if (scanPending) { scanPending = false; startScan(scanWholeReq); }
   if (manualPending) { manualPending = false; doManual(); }
@@ -777,20 +809,36 @@ static void v4LightsWorker() {
 
 static void ltTask(void *) {
   for (;;) {
+    if (!betaOn) break;
     v4LightsWorker();
     vTaskDelay(pdMS_TO_TICKS(15));
   }
+  ltTaskHandle = nullptr;
+  vTaskDelete(nullptr);
 }
 static void v4LightsStart() {
-  if (ltTaskHandle) return;
-  xTaskCreatePinnedToCore(ltTask, "lights", 12288, nullptr, 1, &ltTaskHandle, 1);
+  if (!betaOn || !lts || ltTaskHandle) return;
+  xTaskCreatePinnedToCore(ltTask, "lights", 10240, nullptr, 1, &ltTaskHandle, 1);
 }
 
 static void v4SetBeta(bool on) {
-  betaOn = on;
-  ltSave();
-  if (on) ltScanAt = 0;
-  Serial.printf("# lights beta %s\n", on ? "ON" : "off");
+  if (on) {
+    if (!ltAlloc()) { Serial.println("# beta refused, no memory for light tables"); return; }
+    betaOn = true;
+    Preferences p;
+    p.begin("espradar-v4", true);
+    ltRead(p);
+    p.end();
+    ltScanAt = 0;
+    ltSave();
+    v4LightsStart();
+  } else {
+    betaOn = false;
+    ltSave();
+    for (int i = 0; i < 80 && ltTaskHandle; i++) vTaskDelay(pdMS_TO_TICKS(50));
+    ltFree();
+  }
+  Serial.printf("# lights beta %s\n", betaOn ? "ON" : "off");
 }
 static bool v4Beta() { return betaOn; }
 
@@ -808,7 +856,7 @@ static bool v4LightTest(const char *id, const char *op, int bri) {
 }
 
 static void v4RuleSet(int idx, int used, int link, const char *room, const char *ids, int timeout, int night, int home, int bri) {
-  if (idx < 0 || idx >= RULE_MAX) return;
+  if (!rules || idx < 0 || idx >= RULE_MAX) return;
   Rule &r = rules[idx];
   memset(&r, 0, sizeof r);
   r.used = used ? 1 : 0;
@@ -844,52 +892,49 @@ static const char *brandName(uint8_t b) {
   return "?";
 }
 
-static String v4LightsJson() {
-  String o = "{\"beta\":" + String(betaOn ? "true" : "false") + ",\"v\":\"4.1\",\"night\":" + String(v4IsNight() ? "true" : "false") +
-             ",\"home\":\"" + String(v4HomeCode() == 1 ? "home" : (v4HomeCode() == 2 ? "away" : (v4HomeCode() == 3 ? "checking" : "none"))) +
-             "\",\"diag\":{\"scanning\":" + String(diag.scanning ? "true" : "false") + ",\"phase\":\"";
-  jsonAppendEsc(o, diag.phase);
-  o += "\",\"hosts\":" + String(diag.hosts) + ",\"done\":" + String(diag.done) +
-       ",\"govee\":[" + String(diag.gSent) + "," + String(diag.gRx) +
-       "],\"wiz\":[" + String(diag.wSent) + "," + String(diag.wRx) +
-       "],\"lifx\":[" + String(diag.lSent) + "," + String(diag.lRx) +
-       "],\"tuyaHeard\":" + String(diag.tHeard) + ",\"tuyaOpen\":" + String(diag.tOpen) +
-       ",\"tuyaFrame\":" + String(diag.tFrame) + ",\"bleScanning\":" + String(goveeBleScanning || bleScanReq ? "true" : "false") +
-       "},\"lights\":[";
-  for (int i = 0; i < ltN; i++) {
-    if (i) o += ",";
-    IPAddress ip(lts[i].ip[0], lts[i].ip[1], lts[i].ip[2], lts[i].ip[3]);
+static void v4AppendLights(JBuf &b) {
+  int home = v4HomeCode();
+  b.addf("{\"beta\":%s,\"v\":\"4.1\",\"night\":%s,\"home\":\"%s\",\"diag\":{\"scanning\":%s,\"phase\":\"",
+         betaOn ? "true" : "false", v4IsNight() ? "true" : "false",
+         home == 1 ? "home" : (home == 2 ? "away" : (home == 3 ? "checking" : "none")),
+         diag.scanning ? "true" : "false");
+  b.esc(diag.phase);
+  b.addf("\",\"hosts\":%u,\"done\":%u,\"govee\":[%u,%u],\"wiz\":[%u,%u],\"lifx\":[%u,%u],\"tuyaHeard\":%u,\"tuyaOpen\":%u,\"tuyaFrame\":%u,\"bleScanning\":%s},\"lights\":[",
+         diag.hosts, diag.done, diag.gSent, diag.gRx, diag.wSent, diag.wRx, diag.lSent, diag.lRx,
+         diag.tHeard, diag.tOpen, diag.tFrame, (goveeBleScanning || bleScanReq) ? "true" : "false");
+  for (int i = 0; i < ltN && lts; i++) {
+    if (i) b.add(",");
     bool keyed = lts[i].brand == BR_TUYA && tuyaHasKey(lts[i].id);
-    o += "{\"id\":\"";
-    jsonAppendEsc(o, lts[i].id);
-    o += "\",\"brand\":\"" + String(brandName(lts[i].brand)) + "\",\"ip\":\"" + ip.toString() + "\",\"name\":\"";
-    jsonAppendEsc(o, lts[i].name);
-    o += "\",\"model\":\"";
-    jsonAppendEsc(o, lts[i].model);
-    o += "\",\"on\":" + String(lts[i].on) + ",\"bri\":" + String(lts[i].bri) +
-         ",\"rssi\":" + String((int)lts[i].rssi) +
-         ",\"needsKey\":" + String(lts[i].brand == BR_TUYA && !keyed ? "true" : "false") +
-         ",\"hasKey\":" + String(keyed ? "true" : "false") + ",\"ver\":" + String(lts[i].brand == BR_TUYA ? tuyaVerOf(lts[i].id) : 0) + "}";
+    b.add("{\"id\":\"");
+    b.esc(lts[i].id);
+    b.addf("\",\"brand\":\"%s\",\"ip\":\"%u.%u.%u.%u\",\"name\":\"", brandName(lts[i].brand), lts[i].ip[0], lts[i].ip[1], lts[i].ip[2], lts[i].ip[3]);
+    b.esc(lts[i].name);
+    b.add("\",\"model\":\"");
+    b.esc(lts[i].model);
+    b.addf("\",\"on\":%u,\"bri\":%u,\"rssi\":%d,\"needsKey\":%s,\"hasKey\":%s,\"ver\":%d}",
+           lts[i].on, lts[i].bri, (int)lts[i].rssi,
+           (lts[i].brand == BR_TUYA && !keyed) ? "true" : "false", keyed ? "true" : "false",
+           lts[i].brand == BR_TUYA ? tuyaVerOf(lts[i].id) : 0);
   }
-  o += "],\"rules\":[";
-  for (int i = 0; i < RULE_MAX; i++) {
-    if (i) o += ",";
+  b.add("],\"rules\":[");
+  for (int i = 0; i < RULE_MAX && rules; i++) {
+    if (i) b.add(",");
     const Rule &r = rules[i];
-    o += "{\"i\":" + String(i) + ",\"used\":" + String(r.used ? "true" : "false") + ",\"link\":" + String((int)r.link) +
-         ",\"room\":\"";
-    jsonAppendEsc(o, r.room);
-    o += "\",\"timeout\":" + String(r.timeoutMin) + ",\"night\":" + String((r.flags & 1) ? "true" : "false") +
-         ",\"home\":" + String((r.flags & 2) ? "true" : "false") + ",\"bri\":" + String(r.bri) +
-         ",\"held\":" + String(r.held ? "true" : "false") + ",\"ids\":[";
+    b.addf("{\"i\":%d,\"used\":%s,\"link\":%d,\"room\":\"", i, r.used ? "true" : "false", (int)r.link);
+    b.esc(r.room);
+    b.addf("\",\"timeout\":%u,\"night\":%s,\"home\":%s,\"bri\":%u,\"held\":%s,\"ids\":[",
+           r.timeoutMin, (r.flags & 1) ? "true" : "false", (r.flags & 2) ? "true" : "false", r.bri, r.held ? "true" : "false");
     for (int k = 0; k < r.nId; k++) {
-      if (k) o += ",";
-      o += "\"";
-      jsonAppendEsc(o, r.id[k]);
-      o += "\"";
+      if (k) b.add(",");
+      b.add("\"");
+      b.esc(r.id[k]);
+      b.add("\"");
     }
-    o += "]}";
+    b.add("]}");
   }
-  return o + "]}";
+  b.add("]}");
 }
 
-static String v4LightsSuffix() { return String(",\"beta\":") + (betaOn ? "true" : "false"); }
+static void v4AppendBeta(JBuf &b) {
+  b.addf(",\"beta\":%s", betaOn ? "true" : "false");
+}

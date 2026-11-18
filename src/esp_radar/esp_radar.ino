@@ -34,7 +34,7 @@
 #include "oui_table.h"
 #include "audit_defs.h"
 
-#define FW_VERSION "4.1.1"
+#define FW_VERSION "4.1.2"
 
 // ---------- Heltec WiFi LoRa 32 V4 pins (Heltec pins_arduino.h + Meshtastic variant) ----------
 static const int PIN_VEXT = 36;   // Vext power switch, ACTIVE LOW (powers the OLED)
@@ -62,8 +62,7 @@ Preferences prefs;     // namespace "espradar", keys ssid/pass/sens - unchanged 
 
 String staSsid, staPass, apName, staIp = "", lastErr = "";
 bool setupMode = false, staUp = false, mdnsUp = false;
-volatile bool reqRecal = false, reqRestart = false;
-uint32_t restartAt = 0;
+volatile bool reqRecal = false;
 volatile int sensitivity = 5;         // 1..10
 
 // ---------- v4 motion paths (router + other 2.4 GHz transmitters) ----------
@@ -111,9 +110,11 @@ static void arpProbeIp(IPAddress ip) {
 
 // ---------- motion events ----------
 struct Ev { uint32_t ms; bool start; uint8_t peak; uint32_t durMs; uint8_t link; char name[16]; };
-static Ev evlog[30]; static int evCount = 0;
+static const int EV_N = 30;
+static Ev *evlog = nullptr; static int evCount = 0;
 static void logEvent(bool start, uint8_t peak, uint32_t dur, uint8_t link, const char *name) {
-  if (evCount == 30) { memmove(evlog, evlog + 1, sizeof(Ev) * 29); evCount = 29; }
+  if (!evlog) return;
+  if (evCount >= EV_N) { memmove(evlog, evlog + 1, sizeof(Ev) * (EV_N - 1)); evCount = EV_N - 1; }
   Ev e{};
   e.ms = millis(); e.start = start; e.peak = peak; e.durMs = dur; e.link = link;
   if (name) strncpy(e.name, name, sizeof e.name - 1);
@@ -125,27 +126,30 @@ static String jsonEsc(const String &s) {
 }
 static String macStr(const uint8_t *m) { char b[18]; snprintf(b, sizeof b, "%02X:%02X:%02X:%02X:%02X:%02X", m[0], m[1], m[2], m[3], m[4], m[5]); return b; }
 
-static String stateJson() {
+static void appendState(JBuf &b) {
   State s = snap();
-  char b[800];
-  snprintf(b, sizeof b,
-    "{\"m\":%.1f,\"p\":%.1f,\"s\":\"%s\",\"cal\":%s,\"cp\":%.2f,\"rssi\":%.1f,\"pps\":%.0f,\"ppsAll\":%.0f,\"ping\":%.0f,"
-    "\"score\":%.2f,\"sens\":%d,\"ip\":\"%s\",\"ssid\":\"%s\",\"ap\":\"%s\",\"apip\":\"%s\",\"ch\":%d,"
-    "\"up\":%lu,\"setup\":%s,\"sta\":%s,\"now\":%lu,\"v\":\"" FW_VERSION "\"}",
-    s.level, s.prox, s.calibrating ? "calibrating" : (s.motion ? "motion" : "still"),
-    s.calibrating ? "true" : "false", s.calProgress, s.rssi, s.pps, s.ppsAll, s.pingRate, s.score,
-    sensitivity, staIp.c_str(), jsonEsc(staSsid).c_str(), apName.c_str(), AP_IP.toString().c_str(), staUp ? (int)WiFi.channel() : 0,
-    (unsigned long)(millis() / 1000), setupMode ? "true" : "false", staUp ? "true" : "false", (unsigned long)millis());
-  return String(b);
+  b.addf("{\"m\":%.1f,\"p\":%.1f,\"s\":\"%s\",\"cal\":%s,\"cp\":%.2f,\"rssi\":%.1f,\"pps\":%.0f,\"ppsAll\":%.0f,\"ping\":%.0f,"
+         "\"score\":%.2f,\"sens\":%d,\"ip\":\"%s\",\"ssid\":\"",
+         s.level, s.prox, s.calibrating ? "calibrating" : (s.motion ? "motion" : "still"),
+         s.calibrating ? "true" : "false", s.calProgress, s.rssi, s.pps, s.ppsAll, s.pingRate, s.score,
+         sensitivity, staIp.c_str());
+  b.esc(staSsid.c_str());
+  b.addf("\",\"ap\":\"%s\",\"apip\":\"%u.%u.%u.%u\",\"ch\":%d,\"up\":%lu,\"setup\":%s,\"sta\":%s,\"now\":%lu,\"v\":\"" FW_VERSION "\"",
+         apName.c_str(), AP_IP[0], AP_IP[1], AP_IP[2], AP_IP[3], staUp ? (int)WiFi.channel() : 0,
+         (unsigned long)(millis() / 1000), setupMode ? "true" : "false", staUp ? "true" : "false", (unsigned long)millis());
 }
 
-static String eventsJson() {
-  String o = "{\"now\":" + String(millis()) + ",\"ev\":[";
-  for (int i = 0; i < evCount; i++) {
-    if (i) o += ",";
-    o += "{\"t\":" + String(evlog[i].ms) + ",\"start\":" + (evlog[i].start ? "true" : "false") + ",\"peak\":" + String(evlog[i].peak) + ",\"dur\":" + String(evlog[i].durMs) + ",\"link\":" + String(evlog[i].link) + ",\"name\":\"" + jsonEsc(evlog[i].name) + "\"}";
+static void appendEvents(JBuf &b) {
+  b.addf("{\"now\":%lu,\"ev\":[", (unsigned long)millis());
+  for (int i = 0; i < evCount && evlog; i++) {
+    if (i) b.add(",");
+    b.addf("{\"t\":%lu,\"start\":%s,\"peak\":%u,\"dur\":%lu,\"link\":%u,\"name\":\"",
+           (unsigned long)evlog[i].ms, evlog[i].start ? "true" : "false", evlog[i].peak,
+           (unsigned long)evlog[i].durMs, evlog[i].link);
+    b.esc(evlog[i].name);
+    b.add("\"}");
   }
-  return o + "]}";
+  b.add("]}");
 }
 
 // ---------- RSSI survey sample (coverage mapper) ----------
@@ -169,7 +173,8 @@ static String sampleJson() {
 }
 
 // ---------- WiFi scan (networks view, setup page, per-point AP survey) ----------
-static String scanCache = "[]"; static uint32_t scanAt = 0, scanSeq = 0; static bool scanning = false;
+static char *scanCache = nullptr; static uint32_t scanAt = 0, scanSeq = 0; static bool scanning = false;
+static bool scanPausedSniff = false;
 static const char *authName(wifi_auth_mode_t a) {
   switch (a) {
     case WIFI_AUTH_OPEN: return "OPEN"; case WIFI_AUTH_WEP: return "WEP"; case WIFI_AUTH_WPA_PSK: return "WPA";
@@ -177,28 +182,73 @@ static const char *authName(wifi_auth_mode_t a) {
     case WIFI_AUTH_WPA3_PSK: return "WPA3"; case WIFI_AUTH_WPA2_WPA3_PSK: return "WPA2/WPA3"; default: return "OTHER";
   }
 }
-static void startScan() { if (!scanning) { scanning = true; WiFi.scanDelete(); WiFi.scanNetworks(true, true, false, 120); } }
+static void scanResumeSniff() {
+  if (scanPausedSniff && sniffUser) v4ApplySniffer(true);
+  scanPausedSniff = false;
+}
+static void startScan() {
+  if (scanning) return;
+  scanning = true;
+  heapNote(heapScanMin);
+  WiFi.scanDelete();
+  if (sniffOn) {
+    esp_wifi_set_promiscuous(false);
+    sniffOn = false;
+    scanPausedSniff = true;
+    Serial.println("# wifi scan: promiscuous paused");
+  }
+  int r = WiFi.scanNetworks(true, true, false, 120);
+  if (r != WIFI_SCAN_RUNNING) {
+    scanning = false;
+    WiFi.scanDelete();
+    esp_wifi_scan_stop();
+    scanResumeSniff();
+    heapNote(heapScanMin);
+    Serial.printf("# wifi scan failed to start (%d) heap=%u min=%u\n", r, (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap());
+  }
+}
 static void scanTick() {
   if (!scanning) return;
+  heapNote(heapScanMin);
   int n = WiFi.scanComplete();
   if (n == WIFI_SCAN_RUNNING) return;
   scanning = false;
-  if (n < 0) return;
-  String o = "[";
-  for (int i = 0; i < n && i < 40; i++) {
-    if (i) o += ",";
-    o += "{\"ssid\":\"" + jsonEsc(WiFi.SSID(i)) + "\",\"bssid\":\"" + WiFi.BSSIDstr(i) + "\",\"ch\":" + String(WiFi.channel(i)) +
-         ",\"rssi\":" + String(WiFi.RSSI(i)) + ",\"auth\":\"" + authName(WiFi.encryptionType(i)) + "\",\"open\":" + (WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? "true" : "false") + "}";
+  if (!scanCache) scanCache = (char *)psAlloc(6 * 1024, "scan-json");
+  if (n < 0 || !scanCache) {
+    if (scanCache) { snprintf(scanCache, 8, "[]"); }
+    WiFi.scanDelete();
+    esp_wifi_scan_stop();
+    scanResumeSniff();
+    heapNote(heapScanMin);
+    Serial.printf("# wifi scan failed (%d) heap=%u min=%u\n", n, (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap());
+    return;
   }
-  scanCache = o + "]"; scanAt = millis(); scanSeq++;
+  JBuf b;
+  b.p = scanCache; b.cap = 6 * 1024; b.begin();
+  b.add("[");
+  for (int i = 0; i < n && i < 40; i++) {
+    if (i) b.add(",");
+    String ss = WiFi.SSID(i);
+    b.addf("{\"ssid\":\"");
+    b.esc(ss.c_str());
+    b.addf("\",\"bssid\":\"%s\",\"ch\":%d,\"rssi\":%d,\"auth\":\"%s\",\"open\":%s}",
+           WiFi.BSSIDstr(i).c_str(), (int)WiFi.channel(i), (int)WiFi.RSSI(i), authName(WiFi.encryptionType(i)),
+           WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? "true" : "false");
+  }
+  b.add("]");
+  scanAt = millis(); scanSeq++;
   WiFi.scanDelete();
+  scanResumeSniff();
+  heapNote(heapScanMin);
+  Serial.printf("# wifi scan %d nets heap=%u\n", n, (unsigned)ESP.getFreeHeap());
 }
 
-static String v4DevExtra(int idx);   // defined in v4_presence.h, included after the device table exists
+static void v4AppendDevExtra(JBuf &b, int idx);   // defined in v4_presence.h
 
 // ---------- device discovery (ARP sweep of the home /24, chunked, non-blocking) ----------
 struct Dev { uint8_t mac[6]; uint8_t ip4; uint32_t first, last; char name[16]; bool fresh, known; uint8_t auditSev; };
-static Dev devs[96]; static int devCount = 0;
+static const int DEV_N = 96;
+static Dev *devs = nullptr; static int devCount = 0;
 static bool devScanning = false; static int devNext = 1; static uint32_t devWaitUntil = 0, devScanStart = 0, devScanDone = 0;
 static bool nbPending = false; static uint32_t nbUntil = 0;
 static WiFiUDP nbUdp;
@@ -234,7 +284,7 @@ static void harvestArp() {
       uint8_t last = ip4_addr4(ip);
       int k = 0; for (; k < devCount; k++) if (!memcmp(devs[k].mac, eth->addr, 6)) break;
       if (k == devCount) {
-        if (devCount >= 96) continue;
+        if (!devs || devCount >= DEV_N) continue;
         memset(&devs[k], 0, sizeof(Dev)); memcpy(devs[k].mac, eth->addr, 6); devs[k].first = now; devCount++;
         devs[k].known = isKnown(eth->addr);
         devs[k].fresh = !devs[k].known && knownCount > 0;   // "new" only once a first scan established the baseline
@@ -247,7 +297,8 @@ static void harvestArp() {
 static void addSelf() {
   uint8_t m[6]; WiFi.macAddress(m); uint32_t now = millis();
   int k = 0; for (; k < devCount; k++) if (!memcmp(devs[k].mac, m, 6)) break;
-  if (k == devCount && devCount < 96) { memset(&devs[k], 0, sizeof(Dev)); memcpy(devs[k].mac, m, 6); devs[k].first = now; devs[k].known = true; devCount++; }
+  if (!devs) return;
+  if (k == devCount && devCount < DEV_N) { memset(&devs[k], 0, sizeof(Dev)); memcpy(devs[k].mac, m, 6); devs[k].first = now; devs[k].known = true; devCount++; }
   devs[k].ip4 = WiFi.localIP()[3]; devs[k].last = now; strncpy(devs[k].name, "esp-radar", 15);
 }
 static void sendNbstat(IPAddress ip) {
@@ -298,20 +349,27 @@ static void devTick() {
   UNLOCK_TCPIP_CORE();
   devWaitUntil = millis() + 320;
 }
-static String devicesJson() {
+static void appendDevices(JBuf &b) {
   IPAddress base = staUp ? WiFi.localIP() : IPAddress(0, 0, 0, 0);
   IPAddress gw = WiFi.gatewayIP();
-  String o = "{\"now\":" + String(millis()) + ",\"scanning\":" + (devScanning || nbPending ? "true" : "false") +
-             ",\"progress\":" + String(devScanning ? (devNext * 100) / 255 : 100) + ",\"done\":" + String(devScanDone) +
-             ",\"subnet\":\"" + String(base[0]) + "." + String(base[1]) + "." + String(base[2]) + ".0/24\",\"known\":" + String(knownCount) + ",\"d\":[";
-  for (int k = 0; k < devCount; k++) {
-    if (k) o += ",";
-    String role = devs[k].ip4 == gw[3] ? "router" : (devs[k].ip4 == base[3] ? "this radar" : "");
-    o += "{\"ip\":\"" + String(base[0]) + "." + String(base[1]) + "." + String(base[2]) + "." + String(devs[k].ip4) + "\",\"mac\":\"" + macStr(devs[k].mac) +
-         "\",\"vendor\":\"" + vendorOf(devs[k].mac) + "\",\"name\":\"" + jsonEsc(devs[k].name) + "\",\"first\":" + String(devs[k].first) +
-         ",\"last\":" + String(devs[k].last) + ",\"new\":" + (devs[k].fresh ? "true" : "false") + ",\"audit\":" + String(devs[k].auditSev) + ",\"role\":\"" + role + "\"" + v4DevExtra(k) + "}";
+  b.addf("{\"now\":%lu,\"scanning\":%s,\"progress\":%d,\"done\":%lu,\"subnet\":\"%u.%u.%u.0/24\",\"known\":%d,\"d\":[",
+         (unsigned long)millis(), (devScanning || nbPending) ? "true" : "false",
+         devScanning ? (devNext * 100) / 255 : 100, (unsigned long)devScanDone, base[0], base[1], base[2], knownCount);
+  for (int k = 0; k < devCount && devs; k++) {
+    if (k) b.add(",");
+    const char *role = devs[k].ip4 == gw[3] ? "router" : (devs[k].ip4 == base[3] ? "this radar" : "");
+    char mac[18];
+    snprintf(mac, sizeof mac, "%02X:%02X:%02X:%02X:%02X:%02X", devs[k].mac[0], devs[k].mac[1], devs[k].mac[2], devs[k].mac[3], devs[k].mac[4], devs[k].mac[5]);
+    b.addf("{\"ip\":\"%u.%u.%u.%u\",\"mac\":\"%s\",\"vendor\":\"", base[0], base[1], base[2], devs[k].ip4, mac);
+    b.esc(vendorOf(devs[k].mac));
+    b.add("\",\"name\":\"");
+    b.esc(devs[k].name);
+    b.addf("\",\"first\":%lu,\"last\":%lu,\"new\":%s,\"audit\":%u,\"role\":\"%s\"",
+           (unsigned long)devs[k].first, (unsigned long)devs[k].last, devs[k].fresh ? "true" : "false", devs[k].auditSev, role);
+    v4AppendDevExtra(b, k);
+    b.add("}");
   }
-  return o + "]}";
+  b.add("]}");
 }
 
 // ======================= v3: per-device security audit (pen-test-lite) =======================
@@ -578,17 +636,20 @@ static const char *rstName(esp_reset_reason_t r) {
 #include "v4_presence.h"
 #include "v4_lights.h"
 
-static String fullState() {
-  String s = stateJson();
-  if (s.endsWith("}")) s.remove(s.length() - 1);
-  char h[96];
-  snprintf(h, sizeof h, ",\"rst\":\"%s\",\"heap\":%u,\"minHeap\":%u,\"safe\":%s",
-           rstName(bootReason), (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap(), safeMode ? "true" : "false");
-  s += v4MotionSuffix();
-  s += v4PresenceSuffix();
-  s += v4LightsSuffix();
-  s += h;
-  return s + "}";
+static void appendFull(JBuf &b) {
+  b.begin();
+  appendState(b);
+  if (b.n && b.p[b.n - 1] == '}') b.n--;
+  v4AppendMotion(b);
+  v4AppendPresence(b);
+  v4AppendBeta(b);
+  const char *why = (bootReason == ESP_RST_SW && rstMagic == RST_MAGIC) ? rstWhy : "";
+  b.addf(",\"rst\":\"%s\",\"why\":\"", rstName(bootReason));
+  b.esc(why);
+  b.addf("\",\"heap\":%u,\"minHeap\":%u,\"ps\":%u,\"psFree\":%u,\"scanMin\":%u,\"pageMin\":%u,\"safe\":%s}",
+         (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap(),
+         (unsigned)ESP.getPsramSize(), (unsigned)ESP.getFreePsram(),
+         (unsigned)heapScanMin, (unsigned)heapPageMin, safeMode ? "true" : "false");
 }
 
 // ---------- web server ----------
@@ -598,7 +659,21 @@ static void sendGz(AsyncWebServerRequest *r, const uint8_t *d, size_t n, const c
   res->addHeader("Cache-Control", "no-cache");
   r->send(res);
 }
-static void sendJson(AsyncWebServerRequest *r, const String &s) { r->send(200, "application/json", s); }
+static void sendBuf(AsyncWebServerRequest *r) {
+  heapNote(heapPageMin);
+  r->send(200, "application/json", JB.c_str());
+  heapNote(heapPageMin);
+}
+static bool beginJson() {
+  if (!jbTake()) return false;
+  JB.begin();
+  return true;
+}
+static void sendJson(AsyncWebServerRequest *r, const String &s) {
+  heapNote(heapPageMin);
+  r->send(200, "application/json", s);
+  heapNote(heapPageMin);
+}
 
 static void setupWeb() {
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *r) {
@@ -608,14 +683,26 @@ static void setupWeb() {
   server.on("/app", HTTP_GET, [](AsyncWebServerRequest *r) { sendGz(r, INDEX_HTML_GZ, INDEX_HTML_GZ_LEN, "text/html"); });
   server.on("/radar", HTTP_GET, [](AsyncWebServerRequest *r) { r->redirect("/app"); });
   server.on("/setup", HTTP_GET, [](AsyncWebServerRequest *r) { sendGz(r, SETUP_HTML_GZ, SETUP_HTML_GZ_LEN, "text/html"); });
-  server.on("/api/state", HTTP_GET, [](AsyncWebServerRequest *r) { sendJson(r, fullState()); });
-  server.on("/api/events", HTTP_GET, [](AsyncWebServerRequest *r) { sendJson(r, eventsJson()); });
-  server.on("/api/activity", HTTP_GET, [](AsyncWebServerRequest *r) { sendJson(r, activityJson()); });
+  server.on("/api/state", HTTP_GET, [](AsyncWebServerRequest *r) {
+    if (!beginJson()) { r->send(503, "application/json", "{\"error\":\"busy\"}"); return; }
+    appendFull(JB); sendBuf(r); jbGive();
+  });
+  server.on("/api/events", HTTP_GET, [](AsyncWebServerRequest *r) {
+    if (!beginJson()) { r->send(503, "application/json", "{\"error\":\"busy\"}"); return; }
+    appendEvents(JB); sendBuf(r); jbGive();
+  });
+  server.on("/api/activity", HTTP_GET, [](AsyncWebServerRequest *r) {
+    if (!beginJson()) { r->send(503, "application/json", "{\"error\":\"busy\"}"); return; }
+    v4AppendActivity(JB); sendBuf(r); jbGive();
+  });
   server.on("/api/scan", HTTP_GET, [](AsyncWebServerRequest *r) {
     bool force = r->hasParam("force");
     if (force || scanAt == 0 || millis() - scanAt > 20000) startScan();
-    sendJson(r, "{\"scanning\":" + String(scanning ? "true" : "false") + ",\"seq\":" + String(scanSeq) + ",\"age\":" +
-                String(scanAt ? (millis() - scanAt) / 1000 : -1) + ",\"bssid\":\"" + (staUp ? WiFi.BSSIDstr() : String("")) + "\",\"nets\":" + scanCache + "}");
+    if (!beginJson()) { r->send(503, "application/json", "{\"error\":\"busy\"}"); return; }
+    JB.addf("{\"scanning\":%s,\"seq\":%lu,\"age\":%ld,\"bssid\":\"%s\",\"nets\":%s}",
+            scanning ? "true" : "false", (unsigned long)scanSeq, scanAt ? (long)((millis() - scanAt) / 1000) : -1L,
+            staUp ? WiFi.BSSIDstr().c_str() : "", scanCache ? scanCache : "[]");
+    sendBuf(r); jbGive();
   });
   server.on("/api/sample", HTTP_POST, [](AsyncWebServerRequest *r) {
     if (!staUp) { r->send(409, "application/json", "{\"error\":\"not connected to home WiFi\"}"); return; }
@@ -624,7 +711,10 @@ static void setupWeb() {
     sendJson(r, sampleJson());
   });
   server.on("/api/sample", HTTP_GET, [](AsyncWebServerRequest *r) { sendJson(r, sampleJson()); });
-  server.on("/api/devices", HTTP_GET, [](AsyncWebServerRequest *r) { sendJson(r, devicesJson()); });
+  server.on("/api/devices", HTTP_GET, [](AsyncWebServerRequest *r) {
+    if (!beginJson()) { r->send(503, "application/json", "{\"error\":\"busy\"}"); return; }
+    appendDevices(JB); sendBuf(r); jbGive();
+  });
   server.on("/api/audit/status", HTTP_GET, [](AsyncWebServerRequest *r) {
     int ip = r->hasParam("ip") ? r->getParam("ip")->value().toInt() : 0;
     sendJson(r, auditStatusJson(ip));
@@ -658,14 +748,17 @@ static void setupWeb() {
     if (s.length() == 0 || s.length() > 32 || p.length() > 64) { r->send(400, "text/plain", "bad ssid/password length"); return; }
     prefs.putString("ssid", s); prefs.putString("pass", p);
     sendJson(r, "{\"ok\":true}");
-    reqRestart = true; restartAt = millis() + 1500;
+    armRestart("wifi credentials saved");
   });
   server.on("/api/recal", HTTP_POST, [](AsyncWebServerRequest *r) {
     if (r->hasParam("link", true)) v4RequestRecal(r->getParam("link", true)->value().toInt());
     else reqRecal = true;
     sendJson(r, "{\"ok\":true}");
   });
-  server.on("/api/links", HTTP_GET, [](AsyncWebServerRequest *r) { sendJson(r, v4TalkersJson()); });
+  server.on("/api/links", HTTP_GET, [](AsyncWebServerRequest *r) {
+    if (!beginJson()) { r->send(503, "application/json", "{\"error\":\"busy\"}"); return; }
+    v4AppendTalkers(JB); sendBuf(r); jbGive();
+  });
   server.on("/api/links/auto", HTTP_POST, [](AsyncWebServerRequest *r) {
     sendJson(r, "{\"ok\":true,\"added\":" + String(v4AutoPick()) + "}");
   });
@@ -690,7 +783,10 @@ static void setupWeb() {
     v4SniffUser(on);
     sendJson(r, "{\"sniff\":" + String(on ? "true" : "false") + "}");
   });
-  server.on("/api/presence", HTTP_GET, [](AsyncWebServerRequest *r) { sendJson(r, v4PresenceJson()); });
+  server.on("/api/presence", HTTP_GET, [](AsyncWebServerRequest *r) {
+    if (!beginJson()) { r->send(503, "application/json", "{\"error\":\"busy\"}"); return; }
+    v4AppendPresenceJson(JB); sendBuf(r); jbGive();
+  });
   server.on("/api/device", HTTP_POST, [](AsyncWebServerRequest *r) {
     String macs = r->hasParam("mac", true) ? r->getParam("mac", true)->value() : "";
     uint8_t mac[6];
@@ -707,7 +803,10 @@ static void setupWeb() {
     v4SetClock(tz, setN ? r->getParam("night0", true)->value().toInt() : 19, setN ? r->getParam("night1", true)->value().toInt() : 7, setN);
     sendJson(r, "{\"ok\":true}");
   });
-  server.on("/api/lights", HTTP_GET, [](AsyncWebServerRequest *r) { sendJson(r, v4LightsJson()); });
+  server.on("/api/lights", HTTP_GET, [](AsyncWebServerRequest *r) {
+    if (!beginJson()) { r->send(503, "application/json", "{\"error\":\"busy\"}"); return; }
+    v4AppendLights(JB); sendBuf(r); jbGive();
+  });
   server.on("/api/lights/ble", HTTP_POST, [](AsyncWebServerRequest *r) {
     if (!betaOn) { r->send(409, "application/json", "{\"error\":\"turn Beta on first\"}"); return; }
     v4GoveeBleRequest();
@@ -717,7 +816,8 @@ static void setupWeb() {
     if (!staUp) { r->send(409, "application/json", "{\"error\":\"not connected to home WiFi\"}"); return; }
     bool whole = r->hasParam("whole", true) && r->getParam("whole", true)->value() == "1";
     v4LightScan(whole);
-    sendJson(r, v4LightsJson());
+    if (!beginJson()) { r->send(503, "application/json", "{\"error\":\"busy\"}"); return; }
+    v4AppendLights(JB); sendBuf(r); jbGive();
   });
   server.on("/api/lights/ip", HTTP_POST, [](AsyncWebServerRequest *r) {
     IPAddress ip;
@@ -762,12 +862,18 @@ static void setupWeb() {
   server.on("/api/forget", HTTP_POST, [](AsyncWebServerRequest *r) {
     prefs.remove("ssid"); prefs.remove("pass");
     sendJson(r, "{\"ok\":true}");
-    reqRestart = true; restartAt = millis() + 1500;
+    armRestart("wifi forgotten");
   });
   server.onNotFound([](AsyncWebServerRequest *r) {
     if (setupMode) r->redirect("http://" + AP_IP.toString() + "/setup"); else r->redirect("/");
   });
-  events.onConnect([](AsyncEventSourceClient *c) { c->send(fullState().c_str(), "state", millis(), 1000); });
+  events.onConnect([](AsyncEventSourceClient *c) {
+    if (events.count() > 2) return;
+    if (!jbTake()) return;
+    appendFull(JB);
+    c->send(JB.c_str(), "state", millis(), 1000);
+    jbGive();
+  });
   server.addHandler(&events);
   server.begin();
 }
@@ -850,7 +956,7 @@ static void handleButton() {
     display.drawString(0, 20, "WiFi settings erased"); display.drawString(0, 34, "restarting..."); display.display();
     Serial.println("# PRG long-press: erasing WiFi credentials");
     prefs.remove("ssid"); prefs.remove("pass");
-    reqRestart = true; restartAt = now + 1200;
+    armRestart("PRG long-press erased WiFi");
   }
   if (!pressed && btnDown) {
     if (!btnLong && now - btnDown > 40) { reqRecal = true; Serial.println("# PRG: recalibrating"); }
@@ -862,6 +968,13 @@ void setup() {
   bootReason = esp_reset_reason();
   Serial.begin(115200);
   Serial.printf("# reset %s\n", rstName(bootReason));
+  if (bootReason == ESP_RST_SW && rstMagic == RST_MAGIC) Serial.printf("# restart reason: %s\n", rstWhy);
+  rstMagic = 0;
+  jbInit();
+  v4MotionMem();
+  evlog = (Ev *)psAlloc(sizeof(Ev) * EV_N, "events");
+  devs = (Dev *)psAlloc(sizeof(Dev) * DEV_N, "devices");
+  v4PresenceMem();
   pinMode(PIN_PRG, INPUT_PULLUP);
   pinMode(PIN_LED, OUTPUT); digitalWrite(PIN_LED, LOW);
   oledInit();
@@ -901,6 +1014,9 @@ void setup() {
   nbUdp.begin(41137);
   setupWeb();
   delay(600);
+  heapBoot = ESP.getFreeHeap();
+  Serial.printf("# mem boot internal=%u min=%u psram=%u freePsram=%u\n",
+                (unsigned)heapBoot, (unsigned)ESP.getMinFreeHeap(), (unsigned)ESP.getPsramSize(), (unsigned)ESP.getFreePsram());
   Serial.println("# ESP Radar " FW_VERSION " | AP " + apName + " (pw " + AP_PASS + ") at " + AP_IP.toString());
   Serial.println("ms,level,state,proximity,rssi,csi_pps,csi_all_pps,ping_ok_ps,score,home,paths");
 }
@@ -974,13 +1090,22 @@ void loop() {
   static uint32_t lastHealth = 0;
   if (now - lastHealth >= 10000) {
     lastHealth = now;
-    Serial.printf("# up=%lu rst=%s heap=%u min=%u safe=%d csi=%.0f\n",
+    Serial.printf("# up=%lu rst=%s heap=%u min=%u psram=%u scanMin=%u pageMin=%u safe=%d csi=%.0f\n",
                   (unsigned long)(now / 1000), rstName(bootReason), (unsigned)ESP.getFreeHeap(),
-                  (unsigned)ESP.getMinFreeHeap(), safeMode ? 1 : 0, s.pps);
+                  (unsigned)ESP.getMinFreeHeap(), (unsigned)ESP.getFreePsram(),
+                  (unsigned)heapScanMin, (unsigned)heapPageMin, safeMode ? 1 : 0, s.pps);
   }
 
   if (now - lastFrame >= 50) { lastFrame = now; drawOled(); }
-  if (now - lastSse >= 125) { lastSse = now; if (events.count()) events.send(fullState().c_str(), "state", now); }
+  if (now - lastSse >= 250) {
+    lastSse = now;
+    if (events.count() && jbTake()) {
+      appendFull(JB);
+      events.send(JB.c_str(), "state", now);
+      jbGive();
+      heapNote(heapPageMin);
+    }
+  }
   if (now - lastCsv >= 100) {
     lastCsv = now;
     if (staUp) Serial.printf("%lu,%.1f,%s,%.1f,%.1f,%.0f,%.0f,%.0f,%.2f,%s,%d\n", (unsigned long)now, s.level,

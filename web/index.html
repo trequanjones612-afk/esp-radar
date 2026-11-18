@@ -78,26 +78,53 @@ a{color:var(--gl)}
 .toggle{display:flex;align-items:center;gap:8px;font-size:12px}
 .toggle input{accent-color:var(--g);width:16px;height:16px}
 #audsum{font-size:12px;margin-top:6px}
+#home{font-size:11px;letter-spacing:.12em;border:1px solid var(--g);border-radius:12px;padding:4px 8px;white-space:nowrap}
+#home.away{color:var(--amber);border-color:var(--amber)}
+#home.chk,#home.none{opacity:.65}
+.sim{display:none;margin:6px 12px 0;padding:6px 10px;border:1px dashed var(--amber);color:var(--amber);border-radius:8px;font-size:11px;letter-spacing:.06em}
+.link{display:flex;align-items:center;gap:8px;padding:8px 0;border-bottom:1px dashed rgba(57,255,122,.15)}
+.link .nm{flex:1;min-width:0}
+.link .nm b{display:block;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.link .nm small{opacity:.65}
+.link .lv{width:52px;text-align:right;font-size:16px}
+.mbar{height:6px;border-radius:3px;background:rgba(57,255,122,.15);margin-top:4px;overflow:hidden}
+.mbar i{display:block;height:100%;background:var(--g);width:0}
+.mbar.mot i{background:var(--amber)}
+.beta{border-color:rgba(255,204,51,.7)}
+.beta h3{color:var(--amber)}
+#pathcap{text-align:center;font-size:12px;letter-spacing:.04em;min-height:16px;opacity:.85}
 
 </style></head>
 <body>
-<header><div><span id="dot"></span><b>ESP&nbsp;RADAR</b></div><div id="net">connecting…</div></header>
+<header><div><span id="dot"></span><b>ESP&nbsp;RADAR</b></div><div id="home" class="none">…</div><div id="net">connecting…</div></header>
+<div class="sim" id="sim">SIMULATED PREVIEW — numbers on this page are fake, not from a board</div>
 <main>
 <!-- ============ MOTION ============ -->
 <section id="t-motion" class="on">
   <div id="wrap"><canvas id="meter"></canvas>
     <div id="hud"><div id="pct">--%</div><div id="state">LINK</div></div>
   </div>
-  <p class="cap">Motion intensity from WiFi signal fluctuation — it has no direction or location.</p>
+  <p class="cap">How much the WiFi between a device and this board is disturbed. Not a location.</p>
+  <p id="pathcap"></p>
   <div class="banner" id="banner"></div>
+  <div class="card"><h3><span>PATHS · DEVICE → THIS BOARD</span><span id="sniffst"></span></h3>
+    <div id="links"><p class="note">The router path shows up once the board is on your WiFi.</p></div>
+    <div class="controls" style="margin-top:8px">
+      <button id="autopick">AUTO-PICK STRONGEST</button>
+      <button id="pick">CHOOSE DEVICES</button>
+      <button id="sniffbtn">OTHER DEVICES ON</button>
+    </div>
+    <div id="talkers" style="display:none;margin-top:8px"></div>
+    <p class="note">Each meter is the radio path between that device and this board. It shows which path is disturbed, not where someone is standing. Only devices on this 2.4 GHz channel can be a path — a TV or Echo that stays on 5 GHz (common with eero) will not appear. A row marked RSSI is a weaker signal-strength estimate, not CSI. Untested on this hardware build.</p>
+  </div>
   <div class="card"><h3><span>MOTION · LAST 60 s</span><span>threshold 25%</span></h3><canvas id="graph"></canvas></div>
   <div class="card"><div class="row">
-    <div class="stat"><small>CSI/S</small><span id="pps">--</span></div>
+    <div class="stat"><small>ROUTER CSI/S</small><span id="pps">--</span></div>
     <div class="stat"><small>PING OK/S</small><span id="ping">--</span></div>
     <div class="stat"><small>RSSI</small><span id="rssi">--</span></div>
     <div class="stat"><small>VS BASELINE</small><span id="score">--</span></div>
   </div></div>
-  <div class="card"><h3><span>ROOM ACTIVITY · LAST HOUR</span><span id="actinfo">per minute</span></h3><canvas id="acts"></canvas></div>
+  <div class="card"><h3><span>ROUTER PATH · LAST HOUR</span><span id="actinfo">per minute</span></h3><canvas id="acts"></canvas></div>
   <div class="card"><h3><span>EVENT LOG</span><span id="evc">0</span></h3><ul class="log" id="log"><li class="e"><span>no motion events yet</span></li></ul></div>
   <div class="card"><h3><span>CONTROLS</span><span id="sensv">sensitivity 5</span></h3>
     <div class="controls">
@@ -106,9 +133,30 @@ a{color:var(--gl)}
       <a class="btn" href="/setup">WIFI SETUP</a>
     </div>
     <div class="controls" style="margin-top:10px"><small style="opacity:.7">SENSITIVITY</small><input id="sens" type="range" min="1" max="10" value="5"></div>
-    <p class="note">Recalibrate with the room empty and still (10 s). Sensitivity is saved on the board.</p>
+    <p class="note">Recalibrate with the room empty and still (10 s). Every path keeps its own baseline. Sensitivity is saved on the board.</p>
   </div>
-  <p class="note">How it works: the board measures 51 WiFi subcarriers of every frame your router sends it (~50+ per second) and compares how much they fluctuate against the quiet-room baseline. "VS BASELINE" 1.0× = like the empty room. Moving people, pets or fans raise it. It cannot see, count, or locate anyone.</p>
+  <div class="card beta" id="lightcard"><h3><span>BETA · SMART LIGHTS</span><span>off by default</span></h3>
+    <label class="toggle"><input type="checkbox" id="beta"> Enable beta — local LAN only, no cloud account and no API key</label>
+    <p class="note">Govee lights need <b>LAN Control</b> turned on for each device in the Govee Home app (device settings). WiZ and LIFX are discovered on the local network the same way. Some meshes (including eero) block phone-to-device UDP; if nothing is found, the lights and this board must be able to see each other's broadcasts. This has not been tested on hardware.</p>
+    <div id="lbody" style="display:none">
+      <div class="controls" style="margin-top:8px"><button id="lscan">⟳ LOOK FOR LIGHTS</button><button id="loff">ALL OFF</button><span id="lstat" style="font-size:12px;opacity:.75"></span></div>
+      <div id="llist" style="margin-top:8px"></div>
+      <h3 style="margin-top:12px"><span>RULE</span><span id="rstat"></span></h3>
+      <div class="controls">
+        <select id="rlink"><option value="-1">any path</option></select>
+        <input id="rroom" type="text" placeholder="or room name" maxlength="15" style="max-width:140px">
+      </div>
+      <div id="rlts" class="controls" style="margin-top:8px"></div>
+      <div class="controls" style="margin-top:8px">
+        <small style="opacity:.7">OFF AFTER</small><input id="rmin" type="text" value="5" maxlength="3" style="width:52px"> <small>min</small>
+        <small style="opacity:.7">BRIGHTNESS</small><input id="rbri" type="range" min="10" max="100" value="80">
+      </div>
+      <label class="toggle" style="margin-top:8px"><input type="checkbox" id="rnight"> Only at night</label>
+      <label class="toggle"><input type="checkbox" id="rhome"> Only when Home</label>
+      <div class="controls" style="margin-top:8px"><button id="rsave">SAVE RULE</button><button id="rclear">CLEAR RULE</button></div>
+    </div>
+  </div>
+  <p class="note">The router path is 51 subcarriers from frames your router sends, compared with the quiet-room baseline. "VS BASELINE" 1.0× means that path looks like it did when the room was empty. Other paths are the same idea for a device whose 2.4 GHz radio this board can hear. Moving people, pets or fans raise the number. It cannot see, count, or locate anyone.</p>
 </section>
 
 <!-- ============ COVERAGE ============ -->
@@ -159,6 +207,10 @@ a{color:var(--gl)}
 
 <!-- ============ DEVICES ============ -->
 <section id="t-dev">
+  <div class="card"><h3><span>HOME / AWAY</span><span id="phome">—</span></h3>
+    <p class="note" style="margin-top:0" id="pnote">Mark a phone as a person on its row. Home means that phone has been seen on this LAN. Android sleeps WiFi, so leaving waits 12 minutes. This is not GPS, and a long sleep can look like away.</p>
+    <ul class="log" id="plog"><li class="e"><span>no arrivals yet</span></li></ul>
+  </div>
   <div class="card"><h3><span>DEVICES ON YOUR LAN</span><span id="devsub"></span></h3>
     <div class="controls"><button id="devscan">⟳ SCAN NETWORK</button><span id="devstat" style="font-size:12px;opacity:.75"></span></div>
     <div class="prog"><i id="devprog"></i></div>
@@ -177,7 +229,7 @@ a{color:var(--gl)}
   <div class="card"><h3><span>FOUND</span><span id="devcount"></span></h3><table class="tbl" id="devs"><tr><td>Tap SCAN NETWORK (takes ~15 s).</td></tr></table>
     <div id="audpanel"></div>
   </div>
-  <p class="note">ARP sweep of your home /24 from the board. Vendor comes from the MAC prefix (a built-in table of common brands); phones usually use a <i>private (randomized) MAC</i> per network, so they show no vendor. Names come from NetBIOS when a device answers. Devices that sleep or ignore ARP may be missed. <b>Only scan / audit networks you own or are allowed to scan.</b></p>
+  <p class="note">ARP sweep of your home /24 from the board, plus a slow background pass for online/offline. Uptime, last dropout, flapping (lots of up/down changes) and overnight activity stay in a small log on the board. Vendor comes from the MAC prefix; phones usually use a <i>private (randomized) MAC</i>, so they show no vendor. A device with no vendor that just joined is marked unknown. No port scan was added for this. <b>Only scan networks you own.</b></p>
 </section>
 </main>
 <nav>
@@ -207,7 +259,8 @@ document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{
   if(tab==='cov')layoutPlan(); if(tab==='net'&&!nets.length)scanNets(false); if(tab==='dev')loadDevs();
   location.hash=tab;scrollTo(0,0);
 });
-if(location.hash.length>1){const b=document.querySelector(`nav button[data-t="${location.hash.slice(1)}"]`);if(b)setTimeout(()=>b.click(),0);}
+if(location.hash.length>1){const name=location.hash.slice(1).split('?')[0]; const b=document.querySelector(`nav button[data-t="${name}"]`);if(b)setTimeout(()=>b.click(),0);
+  if(name==='lights') setTimeout(()=>{const mb=document.querySelector('nav button[data-t="motion"]'); if(mb) mb.click(); const el=$('lightcard'); if(el) el.scrollIntoView({block:'start'});},300);}
 
 // ---------------- MOTION ----------------
 const mc=$('meter'),mx=mc.getContext('2d'),gc=$('graph'),gx=gc.getContext('2d'),ac=$('acts'),ax=ac.getContext('2d');
@@ -216,7 +269,7 @@ function resizeAll(){fit(mc);fit(gc);fit(ac);if(typeof drawAct==='function')draw
 addEventListener('resize',resizeAll);resizeAll();
 function renderLog(){
   $('evc').textContent=evs.length;
-  $('log').innerHTML=evs.length?evs.slice(0,40).map(e=>`<li class="${e.start?'s':'e'}"><span>${e.start?'▲ motion started':'▼ motion ended'}</span><span>${fmtTs(e.when)}${!e.start&&e.peak?` · peak ${e.peak}%`:''}${!e.start&&e.dur?` · ${Math.round(e.dur/1000)} s`:''}</span></li>`).join(''):'<li class="e"><span>no motion events yet</span></li>';
+  $('log').innerHTML=evs.length?evs.slice(0,40).map(e=>`<li class="${e.start?'s':'e'}"><span>${e.start?'▲ motion started':'▼ motion ended'}${e.name?` · ${esc(e.name)}`:''}</span><span>${fmtTs(e.when)}${!e.start&&e.peak?` · peak ${e.peak}%`:''}${!e.start&&e.dur?` · ${Math.round(e.dur/1000)} s`:''}</span></li>`).join(''):'<li class="e"><span>no motion events yet</span></li>';
 }
 function addEv(e){evs.push(e);evs.sort((a,b)=>b.when-a.when);renderLog();}
 function beep(){try{audio=audio||new (window.AudioContext||window.webkitAudioContext)();const o=audio.createOscillator(),g=audio.createGain();
@@ -227,10 +280,26 @@ function onState(d){
   $('dot').className='on';
   $('net').innerHTML=(d.ip?d.ip+'<br>':'')+(d.sta?'esp-radar.local · v'+d.v:(d.setup?'setup mode':'joining WiFi…'));
   const noCsi=d.sta&&!d.cal&&d.pps<5;
-  $('pct').textContent=d.cal?Math.round(d.cp*100)+'%':(noCsi?'--':Math.round(d.m)+'%');
+  const loud = !d.cal && d.loudm!=null && d.louds && d.louds!=='wait' && d.louds!=='off' && d.louds!=='low';
+  const showM = loud ? d.loudm : d.m;
+  const showS = loud ? (d.louds==='motion'?'motion':d.louds==='still'?'still':d.s) : d.s;
+  $('pct').textContent=d.cal?Math.round(d.cp*100)+'%':(noCsi&&!loud?'--':Math.round(showM)+'%');
   const se=$('state');
-  se.className=d.cal?'cal':(noCsi?'bad':(d.s==='motion'?'motion':''));
-  se.textContent=!d.sta?'NO WIFI LINK':d.cal?'CALIBRATING · KEEP STILL':noCsi?'NO CSI DATA':(d.s==='motion'?'MOTION':'STILL');
+  se.className=d.cal?'cal':(noCsi&&!loud?'bad':(showS==='motion'?'motion':''));
+  se.textContent=!d.sta?'NO WIFI LINK':d.cal?'CALIBRATING · KEEP STILL':(noCsi&&!loud)?'NO CSI DATA':(showS==='motion'?'MOTION':'STILL');
+  const pc=$('pathcap');
+  if(pc) pc.textContent = d.cal||!d.sta ? '' : (d.loud ? `between ${d.loud} and this board` : 'router path');
+  const hb=$('home');
+  if(hb){
+    const hw=d.home||'none';
+    hb.className=hw==='away'?'away':(hw==='home'?'':(hw==='checking'?'chk':'none'));
+    hb.textContent=hw==='home'?(d.who?`HOME · ${d.who}`:'HOME'):hw==='away'?'AWAY':hw==='checking'?'CHECKING':'NO PEOPLE';
+  }
+  if($('sim')&&String(d.v||'').indexOf('preview')>=0) $('sim').style.display='block';
+  if(d.links) renderLinks(d);
+  const sb=$('sniffbtn');
+  if(sb&&document.activeElement!==sb){ sb.textContent=d.sniffWant===false?'OTHER DEVICES OFF':'OTHER DEVICES ON'; sb.classList.toggle('on', d.sniffWant!==false); }
+  if($('sniffst')) $('sniffst').textContent=d.sniff?'hearing other devices':(d.sniffWant===false?'router only':'sniffer off');
   const pe=$('pps');pe.textContent=Math.round(d.pps);pe.className=d.pps<20?'bad':(d.pps<40?'warn':'');
   $('ping').textContent=Math.round(d.ping);$('rssi').textContent=d.sta?Math.round(d.rssi)+'':'--';
   $('score').textContent=d.cal||!d.score?'--':d.score.toFixed(1)+'×';
@@ -239,17 +308,18 @@ function onState(d){
   if(d.setup){b.style.display='block';b.innerHTML='Setup mode: <a href="/setup">connect the board to your home WiFi</a> — sensing needs a router link.';}
   else if(d.sta&&!d.cal&&d.pps<20){b.style.display='block';b.textContent=`Only ${Math.round(d.pps)} CSI frames/s from your router (want 50+). Readings are unreliable — move the board closer to the router, or check the router isn't blocking ping.`;}
   else b.style.display='none';
-  hist.push({t:Date.now(),m:d.cal?0:d.m});while(hist.length&&hist[0].t<Date.now()-HIST_S*1000)hist.shift();
+  hist.push({t:Date.now(),m:d.cal?0:showM});while(hist.length&&hist[0].t<Date.now()-HIST_S*1000)hist.shift();
   if(!d.cal){
-    if(d.s==='motion')peak=Math.max(peak,Math.round(d.m));
-    if(prevState!==null&&d.s!==prevState){
-      if(d.s==='motion'){addEv({start:true,when:new Date()});if(alerts){navigator.vibrate&&navigator.vibrate([180,80,180]);beep();}}
-      else if(prevState==='motion'){addEv({start:false,peak,when:new Date()});peak=0;}
+    if(showS==='motion')peak=Math.max(peak,Math.round(showM));
+    if(prevState!==null&&showS!==prevState){
+      if(showS==='motion'){addEv({start:true,name:d.loud||'',when:new Date()});if(alerts){navigator.vibrate&&navigator.vibrate([180,80,180]);beep();}}
+      else if(prevState==='motion'){addEv({start:false,peak,name:d.loud||'',when:new Date()});peak=0;}
     }
-    prevState=d.s;
+    prevState=showS;
   }
+  S._show=d.cal?0:((noCsi&&!loud)?0:showM);
 }
-fetch('/api/events').then(r=>r.json()).then(j=>{const base=Date.now()-j.now;for(const e of j.ev)evs.push({start:e.start,peak:e.peak,dur:e.dur,when:new Date(base+e.t)});evs.sort((a,b)=>b.when-a.when);renderLog();}).catch(()=>{});
+fetch('/api/events').then(r=>r.json()).then(j=>{const base=Date.now()-j.now;for(const e of j.ev)evs.push({start:e.start,peak:e.peak,dur:e.dur,name:e.name||'',when:new Date(base+e.t)});evs.sort((a,b)=>b.when-a.when);renderLog();}).catch(()=>{});
 let poll=null;
 function startPoll(){if(poll)return;poll=setInterval(()=>fetch('/api/state').then(r=>r.json()).then(onState).catch(()=>{}),250);}
 try{const es=new EventSource('/events');es.addEventListener('state',e=>{try{onState(JSON.parse(e.data))}catch(_){}});es.onerror=()=>setTimeout(()=>{if(Date.now()-lastMsg>2500)startPoll()},2600);}catch(e){startPoll();}
@@ -258,9 +328,84 @@ $('alert').onclick=()=>{alerts=!alerts;const a=$('alert');a.classList.toggle('on
 $('recal').onclick=()=>post('/api/recal');
 $('sens').onchange=e=>post('/api/sens','v='+e.target.value);
 
+function renderLinks(d){
+  const box=$('links'); if(!box) return;
+  const rows=(d.links||[]).filter(l=>l.on||l.i===0);
+  box.innerHTML=rows.map(l=>{
+    const src=l.src==='rssi'?'<span class="tag">RSSI</span>':(l.src==='csi'?'<span class="tag">CSI</span>':'');
+    const st=({motion:'MOTION',cal:'CALIBRATING',wait:'NO FRAMES',low:'LOW DATA',still:'STILL',off:'OFF'})[l.s]||l.s;
+    const sub=[l.room,st,Math.round(l.pps)+'/s',(l.s==='cal'||l.s==='wait')?'':(l.sc?Number(l.sc).toFixed(1)+'×':'')].filter(Boolean).join(' · ');
+    return `<div class="link"><div class="nm"><b>${esc(l.name||('path '+l.i))}</b> ${src}<small>${esc(sub)}</small><div class="mbar ${l.s==='motion'?'mot':''}"><i style="width:${Math.max(0,Math.min(100,l.m||0))}%"></i></div></div><div class="lv">${(l.s==='cal'||l.s==='wait'||l.s==='off')?'—':Math.round(l.m)+'%'}</div>${l.i?`<button data-slot="${l.i}" class="ln">✎</button><button data-slot="${l.i}" class="lx">✕</button>`:`<button data-slot="0" class="ln">✎</button>`}</div>`;
+  }).join('')||'<p class="note">Router path appears once the board joins your WiFi.</p>';
+  box.querySelectorAll('.ln').forEach(b=>b.onclick=()=>editLink(+b.dataset.slot,d));
+  box.querySelectorAll('.lx').forEach(b=>b.onclick=()=>post('/api/links/clear','slot='+b.dataset.slot));
+  const sel=$('rlink');
+  if(sel&&document.activeElement!==sel){
+    const cur=sel.value;
+    sel.innerHTML='<option value="-1">any path</option>'+rows.map(l=>`<option value="${l.i}">${esc(l.name||('path '+l.i))}</option>`).join('')+'<option value="-2">room name</option>';
+    if([...sel.options].some(o=>o.value===cur)) sel.value=cur;
+  }
+}
+function editLink(slot,d){
+  const cur=(d&&d.links||[]).find(l=>l.i===slot)||{};
+  const name=prompt('Name for this path (shown as “between NAME and this board”)', cur.name||'');
+  if(name==null) return;
+  const room=prompt('Room label (optional, used by light rules)', cur.room||'')||'';
+  const mac=cur.mac||'';
+  if(slot===0){ post('/api/links/set','slot=0&mac='+encodeURIComponent(mac)+'&name='+encodeURIComponent(name.slice(0,19))+'&room='+encodeURIComponent(room.slice(0,15))); return; }
+  if(!mac){ alert('Pick a device first.'); return; }
+  post('/api/links/set','slot='+slot+'&mac='+encodeURIComponent(mac)+'&name='+encodeURIComponent(name.slice(0,19))+'&room='+encodeURIComponent(room.slice(0,15)));
+}
+$('autopick').onclick=()=>post('/api/links/auto').then(()=>$('pick').click());
+$('sniffbtn').onclick=()=>{ const on=$('sniffbtn').textContent.indexOf('OFF')>=0; post('/api/sniff','v='+(on?'1':'0')); };
+async function showTalkers(){
+  const box=$('talkers'); box.style.display='block'; box.innerHTML='<p class="note">Listening…</p>';
+  try{
+    const j=await (await fetch('/api/links')).json();
+    const used=new Set((j.links||[]).map(l=>l.mac));
+    box.innerHTML=(j.talkers||[]).map(t=>`<div class="link"><div class="nm"><b>${esc(t.vendor||t.mac)}</b><small>${t.mac} · ${t.hits} frames · ${t.rssi} dBm</small></div><button class="addt" data-mac="${t.mac}" ${used.has(t.mac)?'disabled':''}>USE</button></div>`).join('')||'<p class="note">No other 2.4 GHz radios heard yet. Devices on 5 GHz will not show up. Leave this open for a minute.</p>';
+    box.querySelectorAll('.addt').forEach(b=>b.onclick=()=>{
+      const slot=((j.links||[]).find(l=>l.i>0&&!l.on)||{}).i || ((j.links||[]).filter(l=>l.i>0).length<5 ? (j.links||[]).filter(l=>l.on).length : 1);
+      const free=(j.links||[]).find(l=>l.i>0&&!l.on);
+      post('/api/links/set','slot='+(free?free.i:1)+'&mac='+encodeURIComponent(b.dataset.mac)+'&name=&room=');
+    });
+  }catch(e){ box.innerHTML='<p class="note">Could not load the device list.</p>'; }
+}
+$('pick').onclick=showTalkers;
+
+let lights=null;
+function renderLights(j){
+  lights=j; const on=!!j.beta; $('beta').checked=on; $('lbody').style.display=on?'block':'none';
+  $('lstat').textContent=on?(j.lights||[]).length+' found':'';
+  $('llist').innerHTML=(j.lights||[]).map(L=>`<div class="link"><div class="nm"><b>${esc(L.name||L.brand)}</b><small>${esc(L.brand)} · ${esc(L.ip)} · ${L.on?'on':'off'}${L.brand==='lifx'?' · on/off only':''}</small></div><button class="lt" data-id="${esc(L.id)}" data-op="on">ON</button><button class="lt" data-id="${esc(L.id)}" data-op="off">OFF</button></div>`).join('')||'<p class="note">None found yet. Enable LAN Control in the Govee app, then look again.</p>';
+  $('llist').querySelectorAll('.lt').forEach(b=>b.onclick=()=>post('/api/lights/test','id='+encodeURIComponent(b.dataset.id)+'&op='+b.dataset.op+'&bri='+$('rbri').value).then(loadLights));
+  const ids=new Set(((j.rules||[])[0]||{}).ids||[]);
+  $('rlts').innerHTML=(j.lights||[]).map(L=>`<label class="toggle"><input type="checkbox" class="rid" value="${esc(L.id)}" ${ids.has(L.id)?'checked':''}> ${esc(L.name||L.id)}</label>`).join('')||'<span class="note">no lights yet</span>';
+  const r=(j.rules||[])[0];
+  if(r&&document.activeElement!==$('rroom')&&document.activeElement!==$('rmin')){
+    if($('rlink').querySelector(`option[value="${r.link}"]`)) $('rlink').value=String(r.link);
+    $('rroom').value=r.room||''; $('rmin').value=r.timeout||5; $('rbri').value=r.bri||80;
+    $('rnight').checked=!!r.night; $('rhome').checked=!!r.home;
+    $('rstat').textContent=r.held?'lights held on':'';
+  }
+}
+async function loadLights(){ try{ renderLights(await (await fetch('/api/lights')).json()); }catch(e){} }
+$('beta').onchange=()=>post('/api/lights/beta','v='+($('beta').checked?'1':'0')).then(loadLights);
+$('lscan').onclick=()=>{ $('lstat').textContent='looking…'; loadLights(); };
+$('loff').onclick=()=>post('/api/lights/test','op=offall').then(loadLights);
+$('rsave').onclick=()=>{
+  const ids=[...document.querySelectorAll('.rid')].filter(x=>x.checked).map(x=>x.value).join(',');
+  const link=$('rroom').value.trim()?-2:+$('rlink').value;
+  post('/api/lights/rule','i=0&used=1&link='+link+'&room='+encodeURIComponent($('rroom').value.trim().slice(0,15))+'&ids='+encodeURIComponent(ids)+'&timeout='+encodeURIComponent($('rmin').value||'5')+'&bri='+$('rbri').value+'&night='+($('rnight').checked?1:0)+'&home='+($('rhome').checked?1:0)).then(loadLights);
+};
+$('rclear').onclick=()=>post('/api/lights/rule','i=0&used=0').then(loadLights);
+setInterval(()=>{ if(tab==='motion') loadLights(); }, 8000);
+post('/api/clock','tz='+(-new Date().getTimezoneOffset()));
+loadLights();
+
 function drawMeter(dt){
   const W=mc.width,H=mc.height,R=Math.min(W,H)/2*0.92,d=dpr();
-  const target=S.cal||(S.sta&&S.pps<5)?0:S.m;lvlDisp+=(target-lvlDisp)*Math.min(1,dt*6);
+  const target=S._show!=null?S._show:(S.cal||(S.sta&&S.pps<5)?0:S.m);lvlDisp+=(target-lvlDisp)*Math.min(1,dt*6);
   const lvl=lvlDisp;
   mx.clearRect(0,0,W,H);mx.save();mx.translate(W/2,H/2);
   // 10 concentric rings: ring k lights when level >= 10k (inner = low, outer = high)
@@ -462,12 +607,31 @@ async function loadDevs(){
     $('devcount').textContent=list.length+' devices'+(list.some(x=>x.new)?` · ${list.filter(x=>x.new).length} new`:'');
     if(list.length)$('devs').innerHTML=list.map(x=>{
       const a=x.audit|0;const badge=a?`<span class="sev sev-${a}" title="${SEV[a]}"></span>`:`<span class="sev sev-0" title="not audited"></span>`;
-      return `<tr data-ip="${esc(x.ip)}"><td>${badge}<b>${esc(x.name||x.vendor||'Unknown device')}</b>${x.role?`<span class="tag">${x.role.toUpperCase()}</span>`:''}${x.new?'<span class="tag new">NEW</span>':''}<small>${x.name&&x.vendor?esc(x.vendor):''}</small></td><td>${x.ip}<small>${x.mac}</small></td><td style="text-align:right"><button class="audbtn" data-ip="${esc(x.ip)}">Scan for issues</button><small>first ${fmtT(new Date(off+x.first))}</small><small>last ${fmtT(new Date(off+x.last))}</small></td></tr>`;
+      const unk=x.new&&!(x.vendor)?'<span class="tag new">UNKNOWN</span>':'';
+      const health=[x.online?'online':'offline', x.up>=0?`up ${x.up}%`:'uptime learning', x.flap>=4?'flapping':'', x.night>0?`overnight ×${x.night}`:'', x.drop?`last drop ${fmtT(new Date(x.drop*1000))}`:'', x.radio?'2.4 GHz radio heard':''].filter(Boolean).join(' · ');
+      const who=esc(x.alias||x.name||x.vendor||'Unknown device');
+      return `<tr data-ip="${esc(x.ip)}"><td>${badge}<b>${who}</b>${x.person?'<span class="tag">PERSON</span>':''}${x.role?`<span class="tag">${esc(x.role).toUpperCase()}</span>`:''}${x.new?'<span class="tag new">NEW</span>':''}${unk}<small>${esc(health)}</small><small>${x.name&&x.vendor?esc(x.vendor):''}</small></td><td>${x.ip}<small>${x.mac}</small></td><td style="text-align:right"><button class="person" data-mac="${esc(x.mac)}" data-on="${x.person?0:1}">${x.person?'Unmark person':'Mark as person'}</button> <button class="alias" data-mac="${esc(x.mac)}" data-name="${esc(x.alias||x.name||'')}">Name</button> <button class="path" data-mac="${esc(x.mac)}">Use as path</button><br><button class="audbtn" data-ip="${esc(x.ip)}">Scan for issues</button><small>first ${fmtT(new Date(off+x.first))}</small><small>last ${fmtT(new Date(off+x.last))}</small></td></tr>`;
     }).join('');
+    document.querySelectorAll('.person').forEach(b=>b.onclick=()=>post('/api/device','mac='+encodeURIComponent(b.dataset.mac)+'&person='+b.dataset.on).then(loadDevs));
+    document.querySelectorAll('.alias').forEach(b=>b.onclick=()=>{ const n=prompt('Name for this device', b.dataset.name||''); if(n==null) return; post('/api/device','mac='+encodeURIComponent(b.dataset.mac)+'&alias='+encodeURIComponent(n.slice(0,15))).then(loadDevs); });
+    document.querySelectorAll('.path').forEach(b=>b.onclick=async()=>{
+      let slot=1;
+      try{ const lj=await (await fetch('/api/links')).json(); const free=(lj.links||[]).find(l=>l.i>0&&!l.on); if(free) slot=free.i; }catch(e){}
+      await post('/api/links/set','slot='+slot+'&mac='+encodeURIComponent(b.dataset.mac)+'&name=&room=');
+      location.hash='motion'; const nb=document.querySelector('nav button[data-t="motion"]'); if(nb) nb.click();
+    });
+    loadPresence();
     document.querySelectorAll('.audbtn').forEach(b=>b.onclick=()=>startAudit(b.dataset.ip));
     clearTimeout(devTimer);if(j.scanning&&tab==='dev')devTimer=setTimeout(loadDevs,800);
     pollAudit();
   }catch(e){$('devstat').textContent='board unreachable';}
+}
+async function loadPresence(){
+  try{
+    const j=await (await fetch('/api/presence')).json();
+    if($('phome')) $('phome').textContent=(j.home||'—').toUpperCase()+(j.who?' · '+j.who:'');
+    if($('plog')) $('plog').innerHTML=(j.log&&j.log.length)?j.log.slice(0,12).map(e=>`<li class="${e.arrive?'s':'e'}"><span>${e.arrive?'▲ arrived':'▼ left'} · ${esc(e.name||e.mac||'')}</span><span>${e.epoch?fmtTs(new Date(e.epoch*1000)):''}</span></li>`).join(''):'<li class="e"><span>no arrivals yet</span></li>';
+  }catch(e){}
 }
 $('devscan').onclick=async()=>{const r=await post('/api/devices/scan');if(!r.ok){$('devstat').textContent='needs a home WiFi connection';return;}setTimeout(loadDevs,300);};
 function defFlag(){return $('auddef').checked?'1':'0';}

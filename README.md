@@ -1,18 +1,21 @@
-# 📡 ESP Radar v3
+# 📡 ESP Radar v4
 
 **A WiFi toolkit for the Heltec WiFi LoRa 32 V4 (ESP32-S3).** Flash it with one command and open it on your phone:
 
-* **Motion**: a room motion meter built from WiFi *Channel State Information* (CSI), with an event log and a one-hour activity timeline.
-* **Coverage**: walk around with the board and build a **WiFi coverage heatmap** of your home on a floor plan you draw or upload.
-* **Networks**: nearby 2.4 GHz networks, a channel congestion chart, and a least-crowded channel recommendation (1/6/11).
-* **Devices**: what's on your home LAN, with IP, MAC, vendor, name, first/last seen, and **NEW** device highlighting.
+* **Motion**: a motion meter for the path between the board and your router, plus a few other always-on 2.4 GHz devices (a TV, an Echo, a console). Each meter is that device-to-board path — which path is disturbed, not where someone is standing.
+* **Home / Away**: mark your phones as people. The OLED and the UI say home or away from presence on the LAN, with a long debounce because Android sleeps its WiFi.
+* **Devices**: who's on the LAN, plus a light health view (uptime, last dropout, flapping, overnight activity, new or unknown joins). The v3 security audit is still there and unchanged.
+* **Beta lights** (off until you turn it on): local on/off and brightness for Govee (LAN Control), plus WiZ and on/off for LIFX. No cloud account and no API key. A motion path can turn chosen lights on and off again after a timeout.
+* **Coverage** and **Networks**: the same v3 tools (walk-around heatmap, 2.4 GHz channel chart).
 
 <p align="center">
-<img src="docs/v3-motion.svg" width="190" alt="Motion tab"> <img src="docs/v3-coverage.svg" width="190" alt="Coverage tab">
-<img src="docs/v3-networks.svg" width="190" alt="Networks tab"> <img src="docs/v3-devices-audit.svg" width="190" alt="Devices tab">
+<img src="docs/v4-motion.png" width="190" alt="Motion paths, simulated"> <img src="docs/v4-devices.png" width="190" alt="Devices health, simulated">
+<img src="docs/v4-lights.png" width="190" alt="Beta lights, simulated">
 </p>
 
-> Screenshots: the real v3 web UI rendered in headless Chrome with a **simulated** data feed (`tools/preview_server.py`), not captured from a live board. The images are PNG screenshots wrapped in SVG so they could be committed as text. The original PNGs are in `docs/` locally.
+> Screenshots: the v4 web UI rendered in headless Chrome with a **simulated** data feed (`tools/preview_server.py`), not captured from a live board. The yellow banner on each image says so. v3 screenshots are still in `docs/`.
+
+**Not tested on hardware.** v3 runs on a real Heltec V4. This v4 firmware compiles with the same toolchain and keeps the same flash layout, but it has not been flashed to a board. CSI from other transmitters uses the API Espressif documents for the ESP32-S3 (promiscuous mode). Whether a particular eero channel, Echo, or Govee bulb behaves is untested. Treat the new numbers as unproven until you recalibrate in an empty room and watch them.
 
 ## ⚡ Flash or update with one command
 
@@ -47,7 +50,15 @@ The script finds Python 3.8+ and installs `esptool` into a private venv (`~/.loc
 v2 moved the setup network from `192.168.4.1` to **`192.168.71.1`**. Many home routers use 192.168.4.x, and the overlap broke v1's traffic to the router. If your home LAN happens to be 192.168.71.x, the board moves its setup network to `172.31.71.1` automatically.
 
 ## ◉ Motion: what the number means (honestly)
-The board keeps pinging your router about 60 times a second. Every frame the router sends back carries CSI: the amplitude of 51 usable OFDM subcarriers. When people move, the radio reflections in the room change, and those amplitudes start to fluctuate.
+The board keeps pinging your router about 60 times a second. Every frame the router sends back carries CSI: the amplitude of 51 usable OFDM subcarriers. When people move, the radio reflections along that path change, and those amplitudes start to fluctuate. That router path is the same meter v3 had.
+
+**Other devices.** A connected station normally only receives frames from its access point, so v3 could not see CSI from an Echo or a TV. Espressif's ESP32-S3 CSI guide says to turn on promiscuous (sniffer) mode to receive CSI from other transmitters. v4 does that, and tags each frame by the transmitter MAC. You pick the links, or tap **Auto-pick strongest**, which takes the few (up to 5, plus the router) radios this board actually hears on its 2.4 GHz channel — frequent and reasonably strong, skipping randomized phone MACs. Each link has its own calibration, baseline, and motion word. The big number follows the loudest path and reads like "between the living-room TV and this board".
+
+What that is **not**: a position, a person count, or a camera. A path lights up when the radio between that device and the board is disturbed. Someone can walk through one path and miss another. Two paths can fire for one person. A fan in front of the TV can look like motion on that path only.
+
+**5 GHz is invisible.** The ESP32-S3 is 2.4 GHz only. An eero often puts Echos, TVs, and consoles on 5 GHz. Those devices still show up in the Devices tab if they answer ARP (the mesh bridges them), but they will not become a motion path, because this board never hears their radio. The path list only offers devices heard as transmitters on this channel. If a chosen link never sends CSI frames, the row stays at "no frames" or, when we still see its signal strength, falls back to **RSSI** variance — a weaker motion estimate, labeled RSSI, not CSI.
+
+There is a button, **Other devices on/off**, if the sniffer ever causes trouble. Router CSI keeps working with it off. That is the v3 behavior.
 
 How the firmware turns that into a number:
 1. **Normalize each frame** by its mean amplitude, which cancels the radio's automatic gain changes.
@@ -58,12 +69,14 @@ How the firmware turns that into a number:
 6. **Adaptive baseline:** the baseline slowly re-learns while the room is quiet.
 
 Limits:
-* It measures **how much the WiFi signal is being disturbed** near the path between the board and the router. It **cannot see, count, identify, or locate** people. There are no blips: v1's radar blips were decorative and have been removed.
+* It measures **how much the WiFi signal is being disturbed** along one device-to-board path (the router, unless you are looking at another link). It **cannot see, count, identify, or locate** people. There are no blips: v1's radar blips were decorative and have been removed. The same six steps run separately on every path.
 * Someone sitting perfectly still may read as STILL. Fans, pets, curtains, or a moving router can read as motion.
 * It needs a good CSI rate. The UI shows **CSI/s** and warns below 20/s; 50+ is the target. **PING OK/S** shows how many pings the router answers. If the router rate-limits ping, the board also sends ARP probes to keep frames coming.
 * Results depend on placement: 1–5 m from the router, with you between them. **Recalibrate** after moving the board, using the button in the UI or a short press on PRG.
 
-The Motion tab also has a **room activity** chart (per-minute average and peak for the last hour; amber = mostly motion), an **event log** (motion started/ended, with the peak and duration, in your phone's clock), alerts (vibrate and beep), recalibrate, and a sensitivity slider (saved on the board).
+The Motion tab also has a **router-path activity** chart (per-minute average and peak for the last hour; amber = mostly motion), an **event log** (motion started/ended on a named path, with the peak and duration, in your phone's clock), alerts (vibrate and beep), recalibrate (every path, room still), and a sensitivity slider (saved on the board, shared by every path).
+
+The OLED shows HOME or AWAY, the loudest path's percent, and MOTION if any path is in motion. The serial CSV is unchanged through `score`, then adds `home` and how many paths are in motion.
 
 ## ▦ Coverage: how to survey your home
 1. On the **Coverage** tab, either draw your rooms (**▭ ROOMS**: drag a rectangle, then name it) or load a photo or screenshot of a floor plan (**🖼 PLAN IMAGE**).
@@ -86,7 +99,23 @@ The board ARP-sweeps your home /24 in small chunks, so it doesn't block anything
 * **First and last seen.**
 * A severity badge once you've audited it (colored dot: OK / Low / Medium / High / Critical).
 
-The board remembers the MACs it has seen in its own NVS namespace (`espradar-dev`), so devices that appear in later scans get a **NEW** tag. Devices that sleep or ignore ARP can be missed. **Only scan networks you own or have permission to scan.**
+The board remembers the MACs it has seen in its own NVS namespace (`espradar-dev`), so devices that appear in later scans get a **NEW** tag. A join with no vendor in the built-in table is also marked **UNKNOWN**. Devices that sleep or ignore ARP can be missed. **Only scan networks you own or have permission to scan.**
+
+### Device health
+From the same ARP discovery (a slow background pass plus the Scan button — not a port scan), each row tracks:
+
+* **Online / offline**, and **uptime %** once it has been watched for about 15 minutes.
+* **Last dropout** (when it went from online to offline).
+* **Flapping** if it changes state several times; the count decays so a one-off blip fades.
+* **Overnight** if it was seen between midnight and 6am on your phone's clock (the UI sends the timezone).
+* A **2.4 GHz radio heard** note when the sniffer has actually received that MAC on this channel.
+
+This is a small record in RAM and in the `espradar-dev` namespace (`hlth`). It does not survive as a full history, and a stale ARP entry can make a quiet device look online for a few minutes. WiFi credentials stay in the original `espradar` namespace and are not rewritten by this.
+
+### Home / Away
+On a device row, **Mark as person** (up to 8, meant for phones). **Home** means at least one of those phones has been seen on the LAN. **Away** means none of them have been seen for **12 minutes**. Arriving takes two fresh sightings, so one stray frame does not count. Android sleeps WiFi for long stretches; the 12 minute leave timer is there so a nap of the radio is not a departure. A phone that stays asleep longer than that, or that the mesh answers for without the phone transmitting, can read as away while you are home. This is presence on the LAN, not GPS.
+
+Arrivals and departures are logged (OLED does not list them; the Devices tab does) and kept across reboot in the same small NVS record. The header on every tab shows HOME, AWAY, CHECKING (the first 90 seconds), or NO PEOPLE.
 
 ### 🔎 Security audit (pen-test-lite)
 On each device row, **Scan for issues** runs a light audit of that IP from the board. **Audit all** walks the discovered list sequentially. Progress shows while it runs; motion sensing continues between devices.
@@ -97,20 +126,31 @@ What it does (all on the board, chunked, non-blocking):
 3. **Risk flags** from the above: Telnet open (High), FTP cleartext (Medium), plain-HTTP admin (Low/Medium), TR-069/7547 (Medium), SMB (Medium), RTSP/camera (Medium), RDP (High), dated banners via a small static hint table (Low–Medium — **not** a CVE database), possible 32764 backdoor (High).
 4. **Default-credential check (optional, default ON):** only against an HTTP(S) login that advertised Basic auth, and only a **capped list of 7 universal pairs** (`admin/admin`, `admin/password`, `admin/(blank)`, `root/root`, `user/user`, `admin/1234`, `support/support`) plus **at most one** vendor-specific pair (e.g. `ubnt/ubnt` for Ubiquiti) → **≤ 8 tries total**. One pass, delay between attempts, **stops on the first success**, reports Critical *"default credentials accepted"* **without showing the password**, never retries, never leaves your /24. Toggle: **Try default logins**.
 
-**Guardrails (built in):** only IPs on the board's own /24 are accepted (everything else, including a WAN address, is rejected). No exploits, no payloads, no password cracking beyond that capped list. The UI and this README say clearly: this is a light audit for networks you own, not nmap/Metasploit; it can miss things and occasionally mis-flag.
+**Guardrails (built in):** only IPs on the board's own /24 are accepted (everything else, including a WAN address, is rejected). No exploits, no payloads, no password cracking beyond that capped list. The UI and this README say clearly: this is a light audit for networks you own, not nmap/Metasploit; it can miss things and occasionally mis-flag. v4 does not add ports, credentials, or checks to this audit.
+
+## 💡 Beta smart lights (off by default)
+On the Motion tab, **BETA · SMART LIGHTS** is off until you turn it on. Nothing is discovered and no UDP is sent until then. There is no Govee / WiZ / LIFX account and no API key. Commands stay on your LAN.
+
+**Govee:** in the Govee Home app, open each light → settings → **LAN Control**, and turn it on. The light has to be on the same LAN as the board. The board scans with the documented local UDP API (multicast `239.255.255.250:4001` and a broadcast, replies on UDP 4002, on/off and brightness to the bulb's port 4003).
+
+**WiZ** (on/off and brightness) and **LIFX** (on/off only; brightness would change the color, so it is not sent) use the same on-device drivers. Another local-API brand can be added the same way. GE Cync is not included: it has no local API that works without an account.
+
+**Rules (one in the UI, up to four in the firmware):** motion on a chosen path, any path, or a room label you typed on a path, turns the chosen lights on. They turn off N minutes after that motion stops (1–180, default 5). Optional: only at night (default 19:00–07:00, using the timezone your phone sends), and/or only when Home. **ON / OFF** next to a found light is a manual test. **ALL OFF** is the panic button.
+
+eero and other meshes sometimes drop client-to-client multicast and broadcast. If a scan finds nothing, LAN Control may be off, or the mesh is not delivering UDP between the board and the bulbs. This whole feature is **untested on hardware**.
 
 ## 🎛 Buttons and display
 | | |
 |---|---|
 | **PRG** short press | recalibrate (room still) |
 | **PRG** hold 3 s | forget WiFi and restart into setup mode |
-| **OLED** | IP, motion %, STILL/MOTION/NO CSI, CSI rate, a real motion bar with the 25% threshold tick, and the last ~2 minutes of motion history (one column per second) |
-| **LED** | blinks while motion is detected |
-| **Serial (115200)** | CSV at 10 Hz: `ms,level,state,proximity,rssi,csi_pps,csi_all_pps,ping_ok_ps,score` |
+| **OLED** | IP, HOME/AWAY/CHK, the loudest path's %, STILL/MOTION/NO CSI, a motion bar with the 25% tick, and the last ~2 minutes of that level (one column per second). CALIBRATING still takes the screen for the router path's first 10 s |
+| **LED** | blinks while any path is in motion |
+| **Serial (115200)** | CSV at 10 Hz: `ms,level,state,proximity,rssi,csi_pps,csi_all_pps,ping_ok_ps,score,home,paths`. The first nine columns are still the **router** path, same as v3. `home` is HOME/AWAY/CHK/----. `paths` is how many paths are in motion |
 
 ## ⚠️ Security and limits
-* The setup network uses a fixed, published password (`espradar`), and the web UI has no login. Anyone on the setup network or your LAN can view it and change the WiFi settings. Treat it as a hobby device.
-* v2 was tested on real Heltec V4 hardware (CSI ~79/s, Devices ~48 hosts). v3's audit has **not** been run against real devices yet. The CSI thresholds may need tuning in your room; use the sensitivity slider.
+* The setup network uses a fixed, published password (`espradar`), and the web UI has no login. Anyone on the setup network or your LAN can view it, change the WiFi settings, and (if you enabled Beta) turn your lights on and off. Treat it as a hobby device.
+* v2 was tested on real Heltec V4 hardware (CSI ~79/s, Devices ~48 hosts). v3's audit has **not** been run against real devices yet. **v4's multi-path CSI, health, home/away, and lights have not been run on hardware at all.** The CSI thresholds may need tuning in your room; use the sensitivity slider. If "other devices" makes the router link worse, turn that sniffer off.
 
 ## 🔙 Back to Meshtastic
 Go to **https://flasher.meshtastic.org** in Chrome or Edge → **Heltec V4** → pick a version → enable **Full Erase and Install** → flash.
@@ -139,6 +179,14 @@ python3 tools/preview_server.py    # preview the phone UI with fake data at http
 ```
 
 ## 📝 Changelog
+**4.0.0**
+* **Motion paths.** Promiscuous mode so CSI can come from other transmitters on the board's 2.4 GHz channel, not only the router. Up to 5 extra links plus the router. Per-link calibration, baseline, and motion word. Auto-pick or manual pick. Friendly name (device alias, NetBIOS, or vendor) and an optional room label. The UI says which device-to-board path is disturbed, not a position. If a link is heard but CSI is too slow, that link falls back to RSSI variance and is labeled RSSI. Sniffer can be turned off; the router path stays.
+* **Device health** on the existing ARP discovery: online/offline, uptime %, last dropout, flapping, overnight (once the phone's timezone is known), NEW and unknown-vendor highlighting. Small NVS record in `espradar-dev`. No new port scan and no credential check. The v3 audit is unchanged.
+* **Home / Away.** Mark phones as people. 12 minute leave debounce, two-sighting arrive. Shown in the header, on the OLED, and as an arrival/departure log.
+* **Beta lights, off by default.** Govee LAN API (you must enable LAN Control per device in the Govee app): discover, on/off, brightness. WiZ on/off/brightness and LIFX on/off share the same rule engine. One rule: a path or room turns chosen lights on, off after N minutes, optionally only at night and/or only when Home. Manual test buttons. No cloud, no API keys.
+* Partition table and the two-region flash layout are unchanged (NVS at `0x9000` still skipped by the flashers). SoftAP still `192.168.71.1`, falling back to `172.31.71.1`. Version 4.0.0 in the UI, on the OLED, and over serial.
+* **Untested on hardware.** Compiled with arduino-cli 1.6.0, arduino-esp32 3.3.13, board `heltec_wifi_lora_32_V4`, `PartitionScheme=no_ota`. UI screenshots are simulated.
+
 **3.0.0**
 * **Security audit (pen-test-lite)** on the Devices tab: per-device "Scan for issues", Audit all, severity badges, progress, session-cached reports.
 * 29-port connect scan + banner/HTTP grab + risk flags + capped default-login check (≤8 pairs, toggleable, stop-on-success).

@@ -12,13 +12,27 @@ SENS = [5]; HYST = {"motion": False, "last": 0.0}
 SAMPLE = {"id": 0, "start": 0.0}
 DEVSCAN = {"start": 0.0}
 random.seed(7)
+BETA = [False]
+RULE = {"i": 0, "used": True, "link": 1, "room": "Living room", "timeout": 5, "night": True, "home": True, "bri": 80, "held": False,
+        "ids": ["AA:BB:CC:DD:EE:01"]}
+
+def link_rows(m, motion):
+    tv = m if motion else 6
+    return [
+        {"i": 0, "mac": "A4:2B:B0:11:22:33", "name": "eero", "room": "", "m": 8 if motion else m, "sc": 1.15, "pps": 64, "rssi": -47, "s": "still" if motion else ("motion" if m >= 25 else "still"), "src": "csi", "on": True},
+        {"i": 1, "mac": "44:65:0D:AB:CD:EF", "name": "Living room TV", "room": "Living room", "m": tv, "sc": 1 + tv / 40, "pps": 22, "rssi": -52, "s": "motion" if motion else "still", "src": "csi", "on": True},
+        {"i": 2, "mac": "D8:EB:46:10:20:30", "name": "Kitchen Echo", "room": "Kitchen", "m": 5, "sc": 1.05, "pps": 14, "rssi": -60, "s": "still", "src": "csi", "on": True},
+        {"i": 3, "mac": "7C:2E:BD:11:00:22", "name": "Roku", "room": "Den", "m": 9, "sc": 1.4, "pps": 3, "rssi": -66, "s": "still", "src": "rssi", "on": True},
+        {"i": 4, "mac": "", "name": "", "room": "", "m": 0, "sc": 0, "pps": 0, "rssi": -100, "s": "off", "src": "none", "on": False},
+        {"i": 5, "mac": "", "name": "", "room": "", "m": 0, "sc": 0, "pps": 0, "rssi": -100, "s": "off", "src": "none", "on": False},
+    ]
 ACT = [[int(max(0, 30 * math.sin(i / 6) + random.uniform(-6, 10))), 0, 0] for i in range(59)]
 for a in ACT: a[1] = min(100, a[0] + random.randint(5, 30)); a[2] = 60 if a[0] > 25 else (10 if a[0] > 15 else 0)
 
 def bms(): return int((time.time() - T0) * 1000) + UP0
 
 def level(t):
-    c = t % 45
+    c = (t + 18) % 45   # open the preview mid-motion so a screenshot shows a disturbed path
     if c < 12: return 2 + random.random() * 4
     if c < 30: return max(0, 55 + 30 * math.sin((c - 12) / 2.2) + random.uniform(-8, 8))
     if c < 36: return max(0, 30 - (c - 30) * 5 + random.uniform(-4, 4))
@@ -33,7 +47,12 @@ def state():
     return {"m": m, "p": min(100, m * 0.8), "s": "motion" if HYST["motion"] else "still", "cal": False, "cp": 1,
             "rssi": -47 + random.uniform(-1.5, 1.5), "pps": 64 + random.randint(-4, 4), "ppsAll": 81 + random.randint(-5, 5),
             "ping": 58 + random.randint(-3, 3), "score": 1 + m / 100 * 5.8, "sens": SENS[0], "ip": "192.168.4.91", "ssid": "HomeWiFi",
-            "ap": "ESP-Radar-3F2A", "apip": "192.168.71.1", "ch": 6, "up": bms() // 1000, "setup": False, "sta": True, "now": bms(), "v": "3.0.0-preview"}
+            "ap": "ESP-Radar-3F2A", "apip": "192.168.71.1", "ch": 6, "up": bms() // 1000, "setup": False, "sta": True, "now": bms(), "v": "4.0.0-preview",
+            "home": "home", "who": "Pixel", "deb": 12, "time": True, "tz": -240, "night0": 19, "night1": 7,
+            "sniff": True, "sniffWant": True, "beta": BETA[0],
+            "loud": "Living room TV" if HYST["motion"] else "eero",
+            "loudm": m if HYST["motion"] else 8, "louds": "motion" if HYST["motion"] else "still",
+            "links": link_rows(m, HYST["motion"])}
 
 NETS = [("HomeWiFi", "A4:2B:B0:11:22:33", 6, -44, "WPA2/WPA3"), ("HomeWiFi-IoT", "A6:2B:B0:11:22:34", 6, -46, "WPA2"),
         ("NETGEAR47", "9C:3D:CF:AA:01:02", 1, -71, "WPA2"), ("xfinitywifi", "3A:1C:22:9B:00:10", 1, -78, "OPEN"),
@@ -98,7 +117,12 @@ class H(BaseHTTPRequestHandler):
             shown = DEVS if not scanning else DEVS[:max(1, int(len(DEVS) * prog / 100))]
             aud_map = {"192.168.4.1":1,"192.168.4.60":3,"192.168.4.112":5,"192.168.4.91":1}
             d = [{"ip": ip, "mac": m, "vendor": v, "name": n, "first": now - (300000 if i < 9 else 40000), "last": now - random.randint(0, 20000),
-                  "new": i >= 9 and role == "", "role": role, "audit": aud_map.get(ip, 0)} for i, (ip, m, v, n, role) in enumerate(shown)]
+                  "new": i >= 9 and role == "", "role": role, "audit": aud_map.get(ip, 0),
+                  "vendor": "" if i == 10 else v,
+                  "alias": "Pixel" if i == 2 else ("Living room TV" if i == 5 else ""),
+                  "person": i == 2, "online": i != 10, "up": 96 if i != 4 else 71, "flap": 6 if i == 4 else 0,
+                  "night": 3 if i in (3, 6) else 0, "drop": int(time.time()) - 5400 if i == 4 else 0,
+                  "hours": 0x0fffff, "radio": i in (3, 5, 6, 7)} for i, (ip, m, v, n, role) in enumerate(shown)]
             return self.j({"now": now, "scanning": scanning, "progress": prog, "done": now - 30000, "subnet": "192.168.4.0/24", "known": 9, "d": d})
         
         if p == "/api/audit/status":
@@ -114,6 +138,23 @@ class H(BaseHTTPRequestHandler):
                            "qlen": AUDIT["qlen"], "scanned": AUDIT["scanned"], "def": AUDIT["def"], "phase": AUDIT["phase"], "report": rep})
         if p == "/api/audit/summary":
             return self.j({"total": 3, "ok": 1, "low": 0, "medium": 1, "high": 0, "critical": 1, "running": AUDIT["running"], "qlen": AUDIT["qlen"]})
+        if p == "/api/links":
+            rows = link_rows(40, True)
+            return self.j({"sniff": True, "links": rows, "talkers": [
+                {"mac": "44:65:0D:AB:CD:EF", "hits": 240, "rssi": -52, "vendor": "Amazon"},
+                {"mac": "D8:EB:46:10:20:30", "hits": 180, "rssi": -60, "vendor": "Amazon"},
+                {"mac": "CC:6E:A4:55:66:77", "hits": 90, "rssi": -58, "vendor": "Samsung"},
+                {"mac": "7C:2E:BD:11:00:22", "hits": 40, "rssi": -66, "vendor": "Roku"}]})
+        if p == "/api/presence":
+            return self.j({"home": "home", "who": "Pixel", "debounceMin": 12, "tz": -240, "night0": 19, "night1": 7, "time": True, "log": [
+                {"t": now - 3600000, "epoch": int(time.time()) - 3600, "arrive": True, "mac": "DA:4F:1C:77:10:02", "name": "Pixel"},
+                {"t": now - 8 * 3600000, "epoch": int(time.time()) - 8 * 3600, "arrive": False, "mac": "DA:4F:1C:77:10:02", "name": "Pixel"}]})
+        if p == "/api/lights":
+            return self.j({"beta": BETA[0], "night": False, "home": "home", "lights": [
+                {"id": "AA:BB:CC:DD:EE:01", "brand": "govee", "ip": "192.168.4.50", "name": "Govee H6008", "model": "H6008", "on": 0, "bri": 80},
+                {"id": "a8bb50112233", "brand": "wiz", "ip": "192.168.4.51", "name": "WiZ lamp", "model": "WiZ", "on": 1, "bri": 60},
+                {"id": "lifx-192.168.4.52", "brand": "lifx", "ip": "192.168.4.52", "name": "LIFX", "model": "LAN", "on": 0, "bri": 0},
+            ] if BETA[0] else [], "rules": [RULE] if BETA[0] else [{"i": 0, "used": False, "link": -1, "room": "", "timeout": 5, "night": False, "home": False, "bri": 80, "held": False, "ids": []}]})
 
         if p == "/events":
             self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.send_header("Cache-Control", "no-cache"); self.end_headers()
@@ -126,6 +167,10 @@ class H(BaseHTTPRequestHandler):
     def do_POST(self):
         n = int(self.headers.get("Content-Length") or 0); body = self.rfile.read(n).decode()
         if self.path == "/api/sens" and body.startswith("v="): SENS[0] = int(body[2:])
+        if self.path == "/api/lights/beta":
+            BETA[0] = "v=1" in body
+        if self.path == "/api/lights/rule" and "used=0" in body:
+            RULE["used"] = False
         if self.path == "/api/sample": SAMPLE["id"] += 1; SAMPLE["start"] = time.time(); return self.j({"id": SAMPLE["id"], "busy": True, "n": 0})
         
         if self.path == "/api/audit":

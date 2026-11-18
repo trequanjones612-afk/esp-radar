@@ -1,10 +1,11 @@
 /*
-  ESP Radar v3 - WiFi CSI motion meter, WiFi coverage mapper, network + device scanner
-  for the Heltec WiFi LoRa 32 V4 (ESP32-S3 + SSD1306/SSD1315 128x64 OLED).
+  ESP Radar v4 - WiFi CSI motion paths, coverage mapper, network + device scanner,
+  device health, home/away, and an off-by-default local smart-light beta.
+  Heltec WiFi LoRa 32 V4 (ESP32-S3 + SSD1306/SSD1315 128x64 OLED).
 
-  Motion: watches how the WiFi signal from your router fluctuates (Channel State Information,
-  per-subcarrier amplitude) and reports a 0-100 motion INTENSITY. It does not see, count or
-  locate people.
+  Motion: Channel State Information along the path from a transmitter to this board.
+  It does not see, count, identify, or locate people. v4 can watch the router and a few
+  other 2.4 GHz devices; each meter is that device-to-board path, not a position.
 
   MIT License - see LICENSE.
 */
@@ -33,7 +34,7 @@
 #include "oui_table.h"
 #include "audit_defs.h"
 
-#define FW_VERSION "3.0.0"
+#define FW_VERSION "4.0.0"
 
 // ---------- Heltec WiFi LoRa 32 V4 pins (Heltec pins_arduino.h + Meshtastic variant) ----------
 static const int PIN_VEXT = 36;   // Vext power switch, ACTIVE LOW (powers the OLED)
@@ -65,171 +66,10 @@ volatile bool reqRecal = false, reqRestart = false;
 uint32_t restartAt = 0;
 volatile int sensitivity = 5;         // 1..10
 
-// ---------- CSI plumbing ----------
-struct CsiPkt { int8_t buf[128]; uint16_t len; int8_t rssi; };
-static QueueHandle_t csiQ;
-static volatile uint8_t apBssid[6];
-static volatile bool bssidValid = false;
-static volatile uint32_t csiAll = 0, csiOurs = 0, csiDrop = 0, pingOk = 0, arpTx = 0;
+// ---------- v4 motion paths (router + other 2.4 GHz transmitters) ----------
+static volatile uint32_t arpTx = 0;
 static esp_ping_handle_t pingH = nullptr;
-
-struct State {
-  float level = 0, prox = 0;
-  bool motion = false, calibrating = true;
-  float calProgress = 0;
-  float score = 0;          // robust variance ratio vs baseline (1.0 = like the still room)
-  float rssi = -100, pps = 0, ppsAll = 0, pingRate = 0;
-  uint32_t evals = 0;
-} st;
-static portMUX_TYPE stMux = portMUX_INITIALIZER_UNLOCKED;
-static State snap() { State s; portENTER_CRITICAL(&stMux); s = st; portEXIT_CRITICAL(&stMux); return s; }
-
-static void csiCb(void *ctx, wifi_csi_info_t *info) {
-  csiAll = csiAll + 1;
-  if (!info || !info->buf || info->len < 128 || !bssidValid) return;
-  for (int i = 0; i < 6; i++) if (info->mac[i] != apBssid[i]) return;   // any frame sent by our AP
-  csiOurs = csiOurs + 1;
-  CsiPkt p;
-  memcpy(p.buf, info->buf, 128);       // first 128 bytes = LLTF, 64 subcarriers (imag, real)
-  p.len = 128;
-  p.rssi = info->rx_ctrl.rssi;
-  if (xQueueSend(csiQ, &p, 0) != pdTRUE) csiDrop = csiDrop + 1;
-}
-
-// LLTF index 0..31 = subcarrier 0..31, 32..63 = -32..-1. Usable: 2..26, 38..63 (skip DC, guards, first word)
-static inline bool usableSc(int k) { return (k >= 2 && k <= 26) || (k >= 38 && k <= 63); }
-static const int NSC = 51;
-
-static float ring[WIN][NSC];
-static float rsum[NSC], rsq[NSC];
-static float emaM[NSC], emaD[NSC];
-static bool emaInit = false;
-static int ringPos = 0, ringFill = 0;
-static float rssiRing[WIN]; static float rssiSum = 0, rssiSq = 0;
-static float baseVar[NSC];
-
-// activity: one bucket per minute of uptime, last 60 minutes
-struct Bucket { uint8_t avg, peak, motionPct; };
-static Bucket act[60]; static int actCount = 0;
-static float bSum = 0; static uint16_t bN = 0, bMot = 0; static uint8_t bPeak = 0; static uint32_t bMinute = 0;
-
-static int cmpf(const void *a, const void *b) { float x = *(const float *)a, y = *(const float *)b; return x < y ? -1 : x > y; }
-
-static void csiTask(void *) {
-  CsiPkt p;
-  float amp[NSC], ratio[NSC];
-  uint32_t calStart = 0, calN = 0; static double calVar[NSC]; double calRssi = 0;
-  float rssiBase = -60, lvl = 0, prox = 0, scoreEma = 1;
-  uint32_t lastAbove = 0, lastEval = 0, ppsT = millis(), lastOurs = 0, lastAll = 0, lastPing = 0;
-  float pps = 0, ppsAll = 0, pingRate = 0;
-  bool motion = false, calibrating = true;
-  for (;;) {
-    bool got = xQueueReceive(csiQ, &p, pdMS_TO_TICKS(50)) == pdTRUE;
-    uint32_t now = millis();
-    if (reqRecal) {
-      reqRecal = false; calibrating = true; calStart = 0; calN = 0; calRssi = 0;
-      memset(calVar, 0, sizeof calVar);
-      ringFill = ringPos = 0; memset(rsum, 0, sizeof rsum); memset(rsq, 0, sizeof rsq);
-      rssiSum = rssiSq = 0; lvl = 0; prox = 0; motion = false; emaInit = false; scoreEma = 1;
-    }
-    if (got) {
-      int j = 0; float mean = 0;
-      for (int k = 0; k < 64; k++) {
-        if (!usableSc(k)) continue;
-        float im = p.buf[2 * k], re = p.buf[2 * k + 1];
-        amp[j] = sqrtf(re * re + im * im); mean += amp[j]; j++;
-      }
-      if (mean > 1.0f) {
-        mean /= NSC;
-        if (!emaInit) { for (int i = 0; i < NSC; i++) { emaM[i] = amp[i] / mean; emaD[i] = 0.05f * emaM[i] + 1e-3f; } emaInit = true; }
-        float *slot = ring[ringPos];
-        bool full = ringFill == WIN;
-        for (int i = 0; i < NSC; i++) {
-          float a = amp[i] / mean;                       // per-packet normalisation (cancels AGC gain steps)
-          float dev = a - emaM[i];
-          float lim = 3.0f * 1.4826f * emaD[i] + 1e-3f;  // Hampel-style outlier clamp
-          if (dev > lim) a = emaM[i] + lim; else if (dev < -lim) a = emaM[i] - lim;
-          emaD[i] = emaD[i] * 0.97f + fabsf(a - emaM[i]) * 0.03f;
-          emaM[i] = emaM[i] * 0.98f + a * 0.02f;
-          if (full) { rsum[i] -= slot[i]; rsq[i] -= slot[i] * slot[i]; }
-          slot[i] = a; rsum[i] += a; rsq[i] += a * a;
-        }
-        if (full) { rssiSum -= rssiRing[ringPos]; rssiSq -= rssiRing[ringPos] * rssiRing[ringPos]; }
-        rssiRing[ringPos] = p.rssi; rssiSum += p.rssi; rssiSq += (float)p.rssi * p.rssi;
-        ringPos = (ringPos + 1) % WIN; if (!full) ringFill++;
-      }
-    }
-    if (now - ppsT >= 1000) {
-      float dt = (now - ppsT) / 1000.0f;
-      uint32_t o = csiOurs, a = csiAll, pg = pingOk;
-      pps = (o - lastOurs) / dt; ppsAll = (a - lastAll) / dt; pingRate = (pg - lastPing) / dt;
-      lastOurs = o; lastAll = a; lastPing = pg; ppsT = now;
-    }
-    if (now - lastEval < 100) continue;      // evaluate at 10 Hz
-    lastEval = now;
-    float rssiMean = -100, rssiStd = 0;
-    bool ready = ringFill >= WIN / 2;
-    float var[NSC];
-    if (ready) {
-      for (int i = 0; i < NSC; i++) { float m = rsum[i] / ringFill; float v = rsq[i] / ringFill - m * m; var[i] = v > 0 ? v : 0; }
-      rssiMean = rssiSum / ringFill;
-      float rv = rssiSq / ringFill - rssiMean * rssiMean; rssiStd = rv > 0 ? sqrtf(rv) : 0;
-    }
-    float calProg = 0;
-    if (calibrating) {
-      if (ready) {
-        if (calStart == 0) calStart = now;
-        for (int i = 0; i < NSC; i++) calVar[i] += var[i];
-        calN++; calRssi += rssiMean;
-        calProg = min(1.0f, (now - calStart) / (float)CAL_MS);
-        if (now - calStart >= CAL_MS && calN >= 30) {
-          float tmp[NSC];
-          for (int i = 0; i < NSC; i++) { baseVar[i] = calVar[i] / calN; tmp[i] = baseVar[i]; }
-          qsort(tmp, NSC, sizeof(float), cmpf);
-          float floorV = max(tmp[NSC / 2] * 0.25f, 1e-6f);    // no subcarrier may have a near-zero baseline
-          for (int i = 0; i < NSC; i++) baseVar[i] = max(baseVar[i], floorV);
-          rssiBase = calRssi / calN; calibrating = false; lvl = 0; scoreEma = 1;
-          Serial.printf("# calibrated: median baseline var=%.6f rssi=%.1f samples=%lu csi=%.0f/s\n", tmp[NSC / 2], rssiBase, (unsigned long)calN, pps);
-        }
-      }
-    } else if (ready) {
-      for (int i = 0; i < NSC; i++) ratio[i] = var[i] / baseVar[i];
-      qsort(ratio, NSC, sizeof(float), cmpf);
-      float score = ratio[(NSC * 3) / 4];                   // 75th percentile: robust to a few noisy subcarriers
-      scoreEma = scoreEma * 0.6f + score * 0.4f;
-      float span = 1.0f + (11 - sensitivity) * 0.8f;        // sens 5 -> 25% at ~2.4x baseline variance
-      float target = constrain(100.0f * (scoreEma - 1.0f) / span, 0.0f, 100.0f);
-      if (pps < 5) target = 0;                              // not enough CSI to say anything
-      lvl = lvl * 0.7f + target * 0.3f;
-      float rssiTerm = constrain(rssiStd * 18.0f + (rssiBase - rssiMean) * 4.0f, 0.0f, 100.0f);
-      float pt = lvl < 3 ? 0 : constrain(lvl * 0.75f + rssiTerm * 0.25f, 0.0f, 100.0f);
-      prox = prox * 0.8f + pt * 0.2f;
-      if (lvl >= 25) { motion = true; lastAbove = now; }
-      else if (motion && lvl < 12 && now - lastAbove > 2000) motion = false;
-      else if (lvl >= 12) lastAbove = now;
-      if (!motion && lvl < 8) {                             // adaptive baseline while the room is quiet
-        for (int i = 0; i < NSC; i++) baseVar[i] = baseVar[i] * 0.998f + max(var[i], 1e-7f) * 0.002f;
-        rssiBase = rssiBase * 0.995f + rssiMean * 0.005f;
-      }
-    }
-    // per-minute activity buckets
-    uint32_t minute = now / 60000;
-    if (minute != bMinute) {
-      if (bN) {
-        if (actCount == 60) { memmove(act, act + 1, sizeof(Bucket) * 59); actCount = 59; }
-        act[actCount++] = { (uint8_t)(bSum / bN), bPeak, (uint8_t)(100 * bMot / bN) };
-      }
-      bSum = 0; bN = 0; bMot = 0; bPeak = 0; bMinute = minute;
-    }
-    if (!calibrating) { bSum += lvl; bN++; if (motion) bMot++; if (lvl > bPeak) bPeak = (uint8_t)lvl; }
-
-    portENTER_CRITICAL(&stMux);
-    st.level = calibrating ? 0 : lvl; st.prox = calibrating ? 0 : prox; st.motion = calibrating ? false : motion;
-    st.calibrating = calibrating; st.calProgress = calProg; st.score = calibrating ? 0 : scoreEma;
-    st.rssi = rssiMean; st.pps = pps; st.ppsAll = ppsAll; st.pingRate = pingRate; st.evals++;
-    portEXIT_CRITICAL(&stMux);
-  }
-}
+#include "v4_motion.h"
 
 // ---------- traffic generator: ICMP echo + ARP probes to the gateway ----------
 static void onPingOk(esp_ping_handle_t, void *) { pingOk = pingOk + 1; }
@@ -263,22 +103,21 @@ static void arpProbeGateway() {
   LOCK_TCPIP_CORE(); etharp_request(nif, &ip); UNLOCK_TCPIP_CORE();
   arpTx = arpTx + 1;
 }
-
-static void startCsi() {
-  wifi_csi_config_t c = {};
-  c.lltf_en = true; c.htltf_en = true; c.stbc_htltf2_en = true; c.ltf_merge_en = true;
-  c.channel_filter_en = false; c.manu_scale = false; c.shift = 0;
-  esp_wifi_set_csi_config(&c);
-  esp_wifi_set_csi_rx_cb(csiCb, nullptr);
-  esp_wifi_set_csi(true);
+static void arpProbeIp(IPAddress ip) {
+  struct netif *nif = staNetif(); if (!nif || ip[3] < 1 || ip[3] > 254) return;
+  ip4_addr_t a; IP4_ADDR(&a, ip[0], ip[1], ip[2], ip[3]);
+  LOCK_TCPIP_CORE(); etharp_request(nif, &a); UNLOCK_TCPIP_CORE();
 }
 
 // ---------- motion events ----------
-struct Ev { uint32_t ms; bool start; uint8_t peak; uint32_t durMs; };
+struct Ev { uint32_t ms; bool start; uint8_t peak; uint32_t durMs; uint8_t link; char name[16]; };
 static Ev evlog[30]; static int evCount = 0;
-static void logEvent(bool start, uint8_t peak, uint32_t dur) {
+static void logEvent(bool start, uint8_t peak, uint32_t dur, uint8_t link, const char *name) {
   if (evCount == 30) { memmove(evlog, evlog + 1, sizeof(Ev) * 29); evCount = 29; }
-  evlog[evCount++] = { millis(), start, peak, dur };
+  Ev e{};
+  e.ms = millis(); e.start = start; e.peak = peak; e.durMs = dur; e.link = link;
+  if (name) strncpy(e.name, name, sizeof e.name - 1);
+  evlog[evCount++] = e;
 }
 
 static String jsonEsc(const String &s) {
@@ -288,7 +127,7 @@ static String macStr(const uint8_t *m) { char b[18]; snprintf(b, sizeof b, "%02X
 
 static String stateJson() {
   State s = snap();
-  char b[640];
+  char b[800];
   snprintf(b, sizeof b,
     "{\"m\":%.1f,\"p\":%.1f,\"s\":\"%s\",\"cal\":%s,\"cp\":%.2f,\"rssi\":%.1f,\"pps\":%.0f,\"ppsAll\":%.0f,\"ping\":%.0f,"
     "\"score\":%.2f,\"sens\":%d,\"ip\":\"%s\",\"ssid\":\"%s\",\"ap\":\"%s\",\"apip\":\"%s\",\"ch\":%d,"
@@ -304,18 +143,7 @@ static String eventsJson() {
   String o = "{\"now\":" + String(millis()) + ",\"ev\":[";
   for (int i = 0; i < evCount; i++) {
     if (i) o += ",";
-    o += "{\"t\":" + String(evlog[i].ms) + ",\"start\":" + (evlog[i].start ? "true" : "false") + ",\"peak\":" + String(evlog[i].peak) + ",\"dur\":" + String(evlog[i].durMs) + "}";
-  }
-  return o + "]}";
-}
-
-static String activityJson() {
-  // buckets are oldest -> newest; the last one ended at the start of the current uptime minute
-  String o = "{\"now\":" + String(millis()) + ",\"minuteStart\":" + String((millis() / 60000) * 60000) + ",\"cur\":{\"avg\":" +
-             String(bN ? (int)(bSum / bN) : 0) + ",\"peak\":" + String(bPeak) + ",\"mot\":" + String(bN ? (int)(100 * bMot / bN) : 0) + "},\"b\":[";
-  for (int i = 0; i < actCount; i++) {
-    if (i) o += ",";
-    o += "[" + String(act[i].avg) + "," + String(act[i].peak) + "," + String(act[i].motionPct) + "]";
+    o += "{\"t\":" + String(evlog[i].ms) + ",\"start\":" + (evlog[i].start ? "true" : "false") + ",\"peak\":" + String(evlog[i].peak) + ",\"dur\":" + String(evlog[i].durMs) + ",\"link\":" + String(evlog[i].link) + ",\"name\":\"" + jsonEsc(evlog[i].name) + "\"}";
   }
   return o + "]}";
 }
@@ -365,6 +193,8 @@ static void scanTick() {
   scanCache = o + "]"; scanAt = millis(); scanSeq++;
   WiFi.scanDelete();
 }
+
+static String v4DevExtra(int idx);   // defined in v4_presence.h, included after the device table exists
 
 // ---------- device discovery (ARP sweep of the home /24, chunked, non-blocking) ----------
 struct Dev { uint8_t mac[6]; uint8_t ip4; uint32_t first, last; char name[16]; bool fresh, known; uint8_t auditSev; };
@@ -479,7 +309,7 @@ static String devicesJson() {
     String role = devs[k].ip4 == gw[3] ? "router" : (devs[k].ip4 == base[3] ? "this radar" : "");
     o += "{\"ip\":\"" + String(base[0]) + "." + String(base[1]) + "." + String(base[2]) + "." + String(devs[k].ip4) + "\",\"mac\":\"" + macStr(devs[k].mac) +
          "\",\"vendor\":\"" + vendorOf(devs[k].mac) + "\",\"name\":\"" + jsonEsc(devs[k].name) + "\",\"first\":" + String(devs[k].first) +
-         ",\"last\":" + String(devs[k].last) + ",\"new\":" + (devs[k].fresh ? "true" : "false") + ",\"audit\":" + String(devs[k].auditSev) + ",\"role\":\"" + role + "\"}";
+         ",\"last\":" + String(devs[k].last) + ",\"new\":" + (devs[k].fresh ? "true" : "false") + ",\"audit\":" + String(devs[k].auditSev) + ",\"role\":\"" + role + "\"" + v4DevExtra(k) + "}";
   }
   return o + "]}";
 }
@@ -724,6 +554,18 @@ static bool sameSubnet(const String &ipStr, uint8_t &last) {
 }
 // ======================= end v3 audit =======================
 
+#include "v4_presence.h"
+#include "v4_lights.h"
+
+static String fullState() {
+  String s = stateJson();
+  if (s.endsWith("}")) s.remove(s.length() - 1);
+  s += v4MotionSuffix();
+  s += v4PresenceSuffix();
+  s += v4LightsSuffix();
+  return s + "}";
+}
+
 // ---------- web server ----------
 static void sendGz(AsyncWebServerRequest *r, const uint8_t *d, size_t n, const char *type) {
   AsyncWebServerResponse *res = r->beginResponse(200, type, d, n);
@@ -741,7 +583,7 @@ static void setupWeb() {
   server.on("/app", HTTP_GET, [](AsyncWebServerRequest *r) { sendGz(r, INDEX_HTML_GZ, INDEX_HTML_GZ_LEN, "text/html"); });
   server.on("/radar", HTTP_GET, [](AsyncWebServerRequest *r) { r->redirect("/app"); });
   server.on("/setup", HTTP_GET, [](AsyncWebServerRequest *r) { sendGz(r, SETUP_HTML_GZ, SETUP_HTML_GZ_LEN, "text/html"); });
-  server.on("/api/state", HTTP_GET, [](AsyncWebServerRequest *r) { sendJson(r, stateJson()); });
+  server.on("/api/state", HTTP_GET, [](AsyncWebServerRequest *r) { sendJson(r, fullState()); });
   server.on("/api/events", HTTP_GET, [](AsyncWebServerRequest *r) { sendJson(r, eventsJson()); });
   server.on("/api/activity", HTTP_GET, [](AsyncWebServerRequest *r) { sendJson(r, activityJson()); });
   server.on("/api/scan", HTTP_GET, [](AsyncWebServerRequest *r) {
@@ -793,7 +635,72 @@ static void setupWeb() {
     sendJson(r, "{\"ok\":true}");
     reqRestart = true; restartAt = millis() + 1500;
   });
-  server.on("/api/recal", HTTP_POST, [](AsyncWebServerRequest *r) { reqRecal = true; sendJson(r, "{\"ok\":true}"); });
+  server.on("/api/recal", HTTP_POST, [](AsyncWebServerRequest *r) {
+    if (r->hasParam("link", true)) v4RequestRecal(r->getParam("link", true)->value().toInt());
+    else reqRecal = true;
+    sendJson(r, "{\"ok\":true}");
+  });
+  server.on("/api/links", HTTP_GET, [](AsyncWebServerRequest *r) { sendJson(r, v4TalkersJson()); });
+  server.on("/api/links/auto", HTTP_POST, [](AsyncWebServerRequest *r) {
+    sendJson(r, "{\"ok\":true,\"added\":" + String(v4AutoPick()) + "}");
+  });
+  server.on("/api/links/clear", HTTP_POST, [](AsyncWebServerRequest *r) {
+    v4LinkClear(r->hasParam("slot", true) ? r->getParam("slot", true)->value().toInt() : -1);
+    sendJson(r, "{\"ok\":true}");
+  });
+  server.on("/api/links/set", HTTP_POST, [](AsyncWebServerRequest *r) {
+    int slot = r->hasParam("slot", true) ? r->getParam("slot", true)->value().toInt() : -1;
+    String macs = r->hasParam("mac", true) ? r->getParam("mac", true)->value() : "";
+    String name = r->hasParam("name", true) ? r->getParam("name", true)->value() : "";
+    String room = r->hasParam("room", true) ? r->getParam("room", true)->value() : "";
+    if (slot == 0) { v4LinkSet(0, nullptr, name.c_str(), room.c_str(), true); sendJson(r, "{\"ok\":true}"); return; }
+    uint8_t mac[6];
+    if (!parseMacStr(macs.c_str(), mac) || !v4LinkSet(slot, mac, name.c_str(), room.c_str(), true)) {
+      r->send(400, "application/json", "{\"error\":\"bad link\"}"); return;
+    }
+    sendJson(r, "{\"ok\":true}");
+  });
+  server.on("/api/sniff", HTTP_POST, [](AsyncWebServerRequest *r) {
+    bool on = !r->hasParam("v", true) || r->getParam("v", true)->value() != "0";
+    v4SniffUser(on);
+    sendJson(r, "{\"sniff\":" + String(on ? "true" : "false") + "}");
+  });
+  server.on("/api/presence", HTTP_GET, [](AsyncWebServerRequest *r) { sendJson(r, v4PresenceJson()); });
+  server.on("/api/device", HTTP_POST, [](AsyncWebServerRequest *r) {
+    String macs = r->hasParam("mac", true) ? r->getParam("mac", true)->value() : "";
+    uint8_t mac[6];
+    if (!parseMacStr(macs.c_str(), mac)) { r->send(400, "application/json", "{\"error\":\"bad mac\"}"); return; }
+    if (r->hasParam("alias", true)) v4SetAlias(mac, r->getParam("alias", true)->value().c_str());
+    if (r->hasParam("person", true) && !v4SetPerson(mac, r->getParam("person", true)->value() != "0")) {
+      r->send(400, "application/json", "{\"error\":\"up to 8 people\"}"); return;
+    }
+    sendJson(r, "{\"ok\":true}");
+  });
+  server.on("/api/clock", HTTP_POST, [](AsyncWebServerRequest *r) {
+    int tz = r->hasParam("tz", true) ? r->getParam("tz", true)->value().toInt() : tzEast;
+    bool setN = r->hasParam("night0", true) && r->hasParam("night1", true);
+    v4SetClock(tz, setN ? r->getParam("night0", true)->value().toInt() : 19, setN ? r->getParam("night1", true)->value().toInt() : 7, setN);
+    sendJson(r, "{\"ok\":true}");
+  });
+  server.on("/api/lights", HTTP_GET, [](AsyncWebServerRequest *r) { sendJson(r, v4LightsJson()); });
+  server.on("/api/lights/beta", HTTP_POST, [](AsyncWebServerRequest *r) {
+    bool on = r->hasParam("v", true) && r->getParam("v", true)->value() == "1";
+    v4SetBeta(on);
+    sendJson(r, "{\"beta\":" + String(on ? "true" : "false") + "}");
+  });
+  server.on("/api/lights/test", HTTP_POST, [](AsyncWebServerRequest *r) {
+    String id = r->hasParam("id", true) ? r->getParam("id", true)->value() : "";
+    String op = r->hasParam("op", true) ? r->getParam("op", true)->value() : "on";
+    int bri = r->hasParam("bri", true) ? r->getParam("bri", true)->value().toInt() : 80;
+    if (!v4LightTest(id.c_str(), op.c_str(), bri)) { r->send(409, "application/json", "{\"error\":\"turn Beta on first, or unknown light\"}"); return; }
+    sendJson(r, "{\"ok\":true}");
+  });
+  server.on("/api/lights/rule", HTTP_POST, [](AsyncWebServerRequest *r) {
+    auto pv = [&](const char *k, const char *d) { return r->hasParam(k, true) ? r->getParam(k, true)->value() : String(d); };
+    v4RuleSet(pv("i", "0").toInt(), pv("used", "1").toInt(), pv("link", "-1").toInt(), pv("room", "").c_str(), pv("ids", "").c_str(),
+              pv("timeout", "5").toInt(), pv("night", "0").toInt(), pv("home", "0").toInt(), pv("bri", "80").toInt());
+    sendJson(r, "{\"ok\":true}");
+  });
   server.on("/api/sens", HTTP_POST, [](AsyncWebServerRequest *r) {
     if (r->hasParam("v", true)) { sensitivity = constrain(r->getParam("v", true)->value().toInt(), 1, 10); prefs.putInt("sens", sensitivity); }
     sendJson(r, "{\"sens\":" + String(sensitivity) + "}");
@@ -806,7 +713,7 @@ static void setupWeb() {
   server.onNotFound([](AsyncWebServerRequest *r) {
     if (setupMode) r->redirect("http://" + AP_IP.toString() + "/setup"); else r->redirect("/");
   });
-  events.onConnect([](AsyncEventSourceClient *c) { c->send(stateJson().c_str(), "state", millis(), 1000); });
+  events.onConnect([](AsyncEventSourceClient *c) { c->send(fullState().c_str(), "state", millis(), 1000); });
   server.addHandler(&events);
   server.begin();
 }
@@ -840,7 +747,7 @@ static void drawOled() {
   }
   display.drawString(0, 0, staUp ? staIp : String("joining WiFi..."));
   display.setTextAlignment(TEXT_ALIGN_RIGHT);
-  display.drawString(128, 0, s.calibrating ? String("CAL") : String((int)s.level) + "%");
+  display.drawString(128, 0, s.calibrating ? String("CAL") : String(v4HomeLabel()));
   display.setTextAlignment(TEXT_ALIGN_LEFT);
   display.drawHorizontalLine(0, 12, 128);
   if (!staUp) {
@@ -853,15 +760,17 @@ static void drawOled() {
     display.drawProgressBar(0, 30, 127, 9, (uint8_t)(s.calProgress * 100));
     display.drawString(0, 44, String("CSI ") + (int)s.pps + "/s  ping " + (int)s.pingRate + "/s");
   } else {
+    LinkView loud; v4Loud(loud);
+    bool any = v4AnyMotion();
     display.setFont(ArialMT_Plain_16);
-    display.drawString(0, 13, s.pps < 5 ? "NO CSI" : (s.motion ? "MOTION" : "STILL"));
+    display.drawString(0, 13, s.pps < 5 && !any ? "NO CSI" : (any ? "MOTION" : "STILL"));
     display.setFont(ArialMT_Plain_10);
     display.setTextAlignment(TEXT_ALIGN_RIGHT);
-    display.drawString(128, 17, String((int)s.pps) + " csi/s");
+    display.drawString(128, 17, String((int)(loud.active ? loud.level : s.level)) + "% " + String(loud.name).substring(0, 8));
     display.setTextAlignment(TEXT_ALIGN_LEFT);
     // motion bar with threshold tick at 25%
     display.drawRect(0, 32, 128, 8);
-    display.fillRect(1, 33, (int)(126 * s.level / 100), 6);
+    display.fillRect(1, 33, (int)(126 * (loud.active ? loud.level : s.level) / 100), 6);
     for (int y = 30; y < 42; y += 2) display.setPixel(32, y);
     // history: last 128 s, one column per second (peak level)
     display.drawHorizontalLine(0, 63, 128);
@@ -901,19 +810,22 @@ void setup() {
   pinMode(PIN_LED, OUTPUT); digitalWrite(PIN_LED, LOW);
   oledInit();
   display.setFont(ArialMT_Plain_16); display.drawString(10, 10, "ESP RADAR");
-  display.setFont(ArialMT_Plain_10); display.drawString(10, 34, "motion - coverage - LAN"); display.drawString(10, 48, "v" FW_VERSION); display.display();
+  display.setFont(ArialMT_Plain_10); display.drawString(10, 34, "paths - health - home"); display.drawString(10, 48, "v" FW_VERSION); display.display();
 
   prefs.begin("espradar", false);
   staSsid = prefs.getString("ssid", ""); staPass = prefs.getString("pass", "");
   sensitivity = prefs.getInt("sens", 5);
   setupMode = staSsid.length() == 0;
   loadKnown();
+  v4LoadLinks();
+  v4PresenceLoad();
+  ltLoad();
 
   uint8_t mac[6]; WiFi.macAddress(mac);
+  v4SetSelf(mac);
   char nm[24]; snprintf(nm, sizeof nm, "ESP-Radar-%02X%02X", mac[4], mac[5]); apName = nm;
 
-  csiQ = xQueueCreate(64, sizeof(CsiPkt));
-  xTaskCreatePinnedToCore(csiTask, "csi", 8192, nullptr, 3, nullptr, 0);
+  v4Start();
   xTaskCreatePinnedToCore(auditTask, "audit", 12288, nullptr, 1, nullptr, 1);
 
   WiFi.persistent(false);
@@ -933,12 +845,12 @@ void setup() {
   setupWeb();
   delay(600);
   Serial.println("# ESP Radar " FW_VERSION " | AP " + apName + " (pw " + AP_PASS + ") at " + AP_IP.toString());
-  Serial.println("ms,level,state,proximity,rssi,csi_pps,csi_all_pps,ping_ok_ps,score");
+  Serial.println("ms,level,state,proximity,rssi,csi_pps,csi_all_pps,ping_ok_ps,score,home,paths");
 }
 
 void loop() {
-  static uint32_t lastFrame = 0, lastSse = 0, lastCsv = 0, lastRetry = 0, staStart = millis(), lastArp = 0;
-  static bool prevMotion = false; static float peak = 0; static uint32_t motionStart = 0;
+  static uint32_t lastFrame = 0, lastSse = 0, lastCsv = 0, lastRetry = 0, staStart = millis(), lastArp = 0, lastProbe = 0, lastDecay = 0;
+  static bool prevLink[V4_LINKS]; static float peakL[V4_LINKS]; static uint32_t motAt[V4_LINKS];
   uint32_t now = millis();
   if (setupMode) dns.processNextRequest();
   handleButton();
@@ -953,14 +865,16 @@ void loop() {
         AP_IP = AP_IP_ALT; startAp();
         Serial.println("# home LAN overlaps the setup AP subnet -> AP moved to " + AP_IP.toString());
       }
-      uint8_t *b = WiFi.BSSID(); for (int i = 0; i < 6; i++) apBssid[i] = b[i]; bssidValid = true;
+      uint8_t self[6]; WiFi.macAddress(self); v4SetSelf(self);
+      v4SetBssid(WiFi.BSSID());
+      v4ApplySniffer(true);
       if (!mdnsUp && MDNS.begin("esp-radar")) { MDNS.addService("http", "tcp", 80); mdnsUp = true; }
       configTime(0, 0, "pool.ntp.org", "time.google.com");
       startPing(); reqRecal = true;
       Serial.printf("# WiFi up: %s ip=%s gw=%s ch=%d bssid=%s -> http://esp-radar.local\n", staSsid.c_str(), staIp.c_str(),
                     WiFi.gatewayIP().toString().c_str(), (int)WiFi.channel(), WiFi.BSSIDstr().c_str());
     } else if (!up && staUp) {
-      staUp = false; bssidValid = false; stopPing(); staIp = ""; lastErr = "lost link"; staStart = now;
+      staUp = false; v4ClearBssid(); stopPing(); staIp = ""; lastErr = "lost link"; staStart = now;
       Serial.println("# WiFi lost, reconnecting");
     }
     if (!up && now - staStart > 20000 && now - lastRetry > 15000) {
@@ -971,18 +885,26 @@ void loop() {
   State s = snap();
   // top up traffic with ARP probes if ICMP replies are scarce (router rate limiting)
   if (staUp && s.pingRate < 25 && now - lastArp >= 25 && !devScanning) { lastArp = now; arpProbeGateway(); }
+  if (staUp && !devScanning && now - lastProbe >= 160) {
+    lastProbe = now;
+    uint8_t mac[6]; IPAddress ip;
+    if (v4NextProbe(mac) && ipForMac(mac, ip)) arpProbeIp(ip);
+  }
 
-  if (!s.calibrating) {
-    if (s.motion) peak = max(peak, s.level);
-    if (s.motion != prevMotion) {
-      if (s.motion) { motionStart = now; logEvent(true, 0, 0); }
-      else { logEvent(false, (uint8_t)peak, now - motionStart); peak = 0; }
-      prevMotion = s.motion;
+  for (int i = 0; i < V4_LINKS; i++) {
+    LinkView v; v4View(i, v);
+    if (!v.active || v.calibrating || !strcmp(v.st, "wait") || !strcmp(v.st, "low")) { prevLink[i] = false; continue; }
+    if (v.motion) peakL[i] = max(peakL[i], v.level);
+    if (v.motion != prevLink[i]) {
+      if (v.motion) { motAt[i] = now; logEvent(true, 0, 0, (uint8_t)i, v.name); }
+      else { logEvent(false, (uint8_t)peakL[i], now - motAt[i], (uint8_t)i, v.name); peakL[i] = 0; }
+      prevLink[i] = v.motion;
     }
   }
-  digitalWrite(PIN_LED, s.motion ? ((now / 120) & 1) : LOW);
+  digitalWrite(PIN_LED, v4AnyMotion() ? ((now / 120) & 1) : LOW);
 
-  secPeak = max(secPeak, s.level);
+  LinkView loud; v4Loud(loud);
+  secPeak = max(secPeak, (loud.active && !loud.calibrating) ? loud.level : s.level);
   if (now - secAt >= 1000) {
     secAt = now;
     if (histN == 128) { memmove(hist, hist + 1, 127); histN = 127; }
@@ -990,13 +912,17 @@ void loop() {
   }
 
   sampleTick(); scanTick(); devTick();
+  v4PresenceTick();
+  v4LightsTick();
+  if (now - lastDecay >= 20000) { lastDecay = now; v4DecayTalkers(); }
 
   if (now - lastFrame >= 50) { lastFrame = now; drawOled(); }
-  if (now - lastSse >= 125) { lastSse = now; if (events.count()) events.send(stateJson().c_str(), "state", now); }
+  if (now - lastSse >= 125) { lastSse = now; if (events.count()) events.send(fullState().c_str(), "state", now); }
   if (now - lastCsv >= 100) {
     lastCsv = now;
-    if (staUp) Serial.printf("%lu,%.1f,%s,%.1f,%.1f,%.0f,%.0f,%.0f,%.2f\n", (unsigned long)now, s.level,
-      s.calibrating ? "calibrating" : (s.motion ? "motion" : "still"), s.prox, s.rssi, s.pps, s.ppsAll, s.pingRate, s.score);
+    if (staUp) Serial.printf("%lu,%.1f,%s,%.1f,%.1f,%.0f,%.0f,%.0f,%.2f,%s,%d\n", (unsigned long)now, s.level,
+      s.calibrating ? "calibrating" : (s.motion ? "motion" : "still"), s.prox, s.rssi, s.pps, s.ppsAll, s.pingRate, s.score,
+      v4HomeLabel(), v4MotionCount());
   }
   delay(2);
 }

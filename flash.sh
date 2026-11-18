@@ -3,7 +3,8 @@
 #   curl -fsSL https://raw.githubusercontent.com/trequanjones612-afk/esp-radar/main/flash.sh | bash
 # Options (environment variables):
 #   ESP_RADAR_PORT=/dev/ttyACM0   use this serial port instead of auto-detecting
-#   ESP_RADAR_ERASE=1             erase the whole flash first (recommended when coming from Meshtastic)
+#   ESP_RADAR_ERASE=1             erase the whole flash first (wipes saved WiFi; recommended when coming from Meshtastic)
+# By default the NVS partition (saved WiFi + settings) is NOT written, so updates keep your settings.
 #   ESP_RADAR_DRY_RUN=1           do everything except writing to the board
 #   ESP_RADAR_REF=main            git branch/tag to download the firmware from
 # No sudo is used. Everything lives in ~/.local/share/esp-radar.
@@ -94,6 +95,12 @@ ART
   [ "$want" = "$got" ] || die "Checksum mismatch (expected $want, got $got)."
   mv "$tmp/fw.bin" "$BIN"
   say "Firmware OK: $(wc -c < "$BIN" | tr -d ' ') bytes, sha256 ${got:0:16}…"
+  # Split the merged image so the NVS partition (0x9000-0xDFFF: saved WiFi + settings) is never written:
+  #   part 1 = 0x0000-0x8FFF (bootloader + partition table), part 2 = 0xE000-end (otadata + app)
+  local P1="$HOME_DIR/part-0x0000.bin" P2="$HOME_DIR/part-0xe000.bin"
+  dd if="$BIN" of="$P1" bs=4096 count=9 2>/dev/null
+  dd if="$BIN" of="$P2" bs=4096 skip=14 2>/dev/null
+  [ "$(wc -c < "$P1" | tr -d ' ')" = "36864" ] && [ -s "$P2" ] || die "Could not split the firmware image."
 
   # ---- 3. serial port ----
   local PORT="${ESP_RADAR_PORT:-}"
@@ -132,7 +139,7 @@ ART
   fi
 
   # ---- 4. flash ----
-  local cmd="$ESPTOOL --chip esp32s3 --port $PORT --baud 921600 write_flash 0x0 $BIN"
+  local cmd="$ESPTOOL --chip esp32s3 --port $PORT --baud 921600 write_flash 0x0 $P1 0xe000 $P2"
   if [ "$DRY" = "1" ]; then
     say "DRY RUN - would run:"
     [ "${ESP_RADAR_ERASE:-0}" = "1" ] && echo "   $ESPTOOL --chip esp32s3 --port $PORT erase_flash"
@@ -144,21 +151,25 @@ ART
     $ESPTOOL --chip esp32s3 --port "$PORT" erase_flash
   fi
   say "Flashing (about 20 s)…"
-  if ! $ESPTOOL --chip esp32s3 --port "$PORT" --baud 921600 write_flash 0x0 "$BIN"; then
+  if [ "${ESP_RADAR_ERASE:-0}" = "1" ]; then
+    say "Flash erased: saved WiFi settings are gone, you will get setup mode."
+  else
+    say "Keeping your saved WiFi + settings (NVS at 0x9000 is not touched)."
+  fi
+  if ! $ESPTOOL --chip esp32s3 --port "$PORT" --baud 921600 write_flash 0x0 "$P1" 0xe000 "$P2"; then
     warn "Flash failed. Retrying at 115200 baud…"
-    $ESPTOOL --chip esp32s3 --port "$PORT" --baud 115200 write_flash 0x0 "$BIN" || die \
+    $ESPTOOL --chip esp32s3 --port "$PORT" --baud 115200 write_flash 0x0 "$P1" 0xe000 "$P2" || die \
       "Still failing. Put the board in download mode: hold PRG, tap RST, release PRG - then re-run this command."
   fi
 
   printf '\n%s' "$G"
   cat <<'DONE'
-  ✔ ESP Radar is flashed! Next steps:
-    1. The OLED shows "SETUP MODE". On your phone, join WiFi  ESP-Radar-XXXX
-       (password: espradar).
-    2. Open  http://192.168.4.1  and pick your home 2.4 GHz WiFi + password.
-    3. The board restarts, joins your WiFi and calibrates for ~10 s - keep the room still.
-    4. Open the radar at  http://esp-radar.local  (or the IP on the OLED),
-       or keep using http://192.168.4.1 on the ESP-Radar network.
+  ✔ ESP Radar v2 is flashed! Next steps:
+    * Already set up before? It rejoins your WiFi by itself - open http://esp-radar.local
+      (or the IP on the OLED). Keep the room still for the 10 s calibration.
+    * New board / erased: the OLED shows "SETUP MODE". On your phone join WiFi
+      ESP-Radar-XXXX (password: espradar), open  http://192.168.71.1  and pick your
+      home 2.4 GHz WiFi. (v2 moved the setup AP from 192.168.4.1 to 192.168.71.1.)
     Short-press PRG = recalibrate · hold PRG 3 s = forget WiFi.
 DONE
   printf '%s\n' "$N"

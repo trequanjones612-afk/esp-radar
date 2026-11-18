@@ -14,6 +14,7 @@ esp-web-install-button button{font:inherit;font-size:16px;letter-spacing:.15em;f
 <ol>
 <li>Plug the board in with a USB-C <b>data</b> cable.</li>
 <li>Click <b>CONNECT</b>, pick the board's port, then <b>Install</b>.</li>
+<li>Updating from v1? Leave <b>Erase device</b> unticked to keep your saved WiFi.</li>
 <li>If no port appears / it won't connect: hold <b>PRG</b>, tap <b>RST</b>, release <b>PRG</b>, try again.</li>
 </ol>
 <p id="st">Loading firmware…</p>
@@ -21,7 +22,7 @@ esp-web-install-button button{font:inherit;font-size:16px;letter-spacing:.15em;f
   <span slot="unsupported">Your browser has no Web Serial. Use desktop Chrome or Edge.</span>
   <span slot="not-allowed">This page must be opened over https:// or http://localhost.</span>
 </esp-web-install-button>
-<p>Afterwards: join WiFi <b>ESP-Radar-XXXX</b> (password <b>espradar</b>) and open <b>http://192.168.4.1</b>.</p>
+<p>Afterwards: join WiFi <b>ESP-Radar-XXXX</b> (password <b>espradar</b>) and open <b>http://192.168.71.1</b>.</p>
 <p><a href="https://github.com/trequanjones612-afk/esp-radar">github.com/trequanjones612-afk/esp-radar</a></p>
 </div>
 <script>
@@ -37,9 +38,13 @@ const st = document.getElementById('st');
     const bin = Uint8Array.from(atob(b64.replace(/\s+/g, '')), c => c.charCodeAt(0));
     const dig = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', bin))).map(b => b.toString(16).padStart(2, '0')).join('');
     if (dig !== sha.trim()) throw new Error('checksum mismatch');
-    const binUrl = URL.createObjectURL(new Blob([bin], { type: 'application/octet-stream' }));
-    const manifest = { name: 'ESP Radar', version: '1.0.0', new_install_prompt_erase: true,
-      builds: [{ chipFamily: 'ESP32-S3', parts: [{ path: binUrl, offset: 0 }] }] };
+    // Two parts that skip the NVS partition (0x9000-0xDFFF) so an update keeps saved WiFi settings
+    // (unless you tick "Erase device" in the install dialog).
+    const blob = b => URL.createObjectURL(new Blob([b], { type: 'application/octet-stream' }));
+    const manifest = { name: 'ESP Radar', version: '2.0.0', new_install_prompt_erase: true,
+      builds: [{ chipFamily: 'ESP32-S3', parts: [
+        { path: blob(bin.slice(0, 0x9000)), offset: 0 },
+        { path: blob(bin.slice(0xE000)), offset: 0xE000 }] }] };
     document.getElementById('btn').setAttribute('manifest', URL.createObjectURL(new Blob([JSON.stringify(manifest)], { type: 'application/json' })));
     st.textContent = 'Firmware ready: ' + bin.length.toLocaleString() + ' bytes, sha256 ' + dig.slice(0, 16) + '…';
     st.style.color = '#39ff7a';

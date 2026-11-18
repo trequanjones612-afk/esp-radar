@@ -13,15 +13,15 @@ button{width:100%;margin-top:16px;font:inherit;font-size:15px;padding:12px;borde
 #nets li{padding:9px 6px;border-bottom:1px dashed rgba(57,255,122,.2);display:flex;justify-content:space-between;cursor:pointer}
 #nets li:hover{background:rgba(57,255,122,.1)}#msg{margin-top:12px;font-size:13px;color:#ffcc33}a{color:#b6ffcf}
 </style></head><body><div class="box">
-<h1>ESP RADAR · WIFI</h1>
+<h1>ESP RADAR · WIFI</h1><p style="opacity:.5;margin:0">v2.0.0</p>
 <p>Connect the radar to your home WiFi (2.4&nbsp;GHz). It needs a link to your router: motion is sensed from the router's signal (WiFi CSI).
-After saving, the board restarts. You can still reach it at <b>192.168.4.1</b> on this setup network, or at <b>http://esp-radar.local</b> / its IP (shown on the OLED) from your home WiFi.</p>
+After saving, the board restarts. You can still reach it at <b>192.168.71.1</b> on this setup network, or at <b>http://esp-radar.local</b> / its IP (shown on the OLED) from your home WiFi.</p>
 <label>NEARBY NETWORKS</label><ul id="nets"><li>scanning…</li></ul>
 <form id="f"><label for="ssid">NETWORK NAME (SSID)</label><input id="ssid" name="ssid" maxlength="32" required autocomplete="off">
 <label for="pass">PASSWORD</label><input id="pass" name="pass" type="password" maxlength="64" autocomplete="off">
 <button type="submit">SAVE &amp; CONNECT</button></form>
 <button class="sec" id="rescan">RESCAN</button>
-<p id="msg"></p><p><a href="/radar">→ open radar</a></p>
+<p id="msg"></p><p><a href="/app">→ open radar</a></p>
 </div><script>
 const $=i=>document.getElementById(i);
 function scan(){fetch('/api/scan').then(r=>r.json()).then(j=>{if(j.scanning){$('nets').innerHTML='<li>scanning…</li>';setTimeout(scan,1500);return;}

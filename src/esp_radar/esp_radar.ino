@@ -34,7 +34,7 @@
 #include "oui_table.h"
 #include "audit_defs.h"
 
-#define FW_VERSION "4.0.0"
+#define FW_VERSION "4.1.0"
 
 // ---------- Heltec WiFi LoRa 32 V4 pins (Heltec pins_arduino.h + Meshtastic variant) ----------
 static const int PIN_VEXT = 36;   // Vext power switch, ACTIVE LOW (powers the OLED)
@@ -683,6 +683,35 @@ static void setupWeb() {
     sendJson(r, "{\"ok\":true}");
   });
   server.on("/api/lights", HTTP_GET, [](AsyncWebServerRequest *r) { sendJson(r, v4LightsJson()); });
+  server.on("/api/lights/ble", HTTP_POST, [](AsyncWebServerRequest *r) {
+    if (!betaOn) { r->send(409, "application/json", "{\"error\":\"turn Beta on first\"}"); return; }
+    v4GoveeBleRequest();
+    sendJson(r, "{\"ok\":true,\"scanning\":true}");
+  });
+  server.on("/api/lights/scan", HTTP_POST, [](AsyncWebServerRequest *r) {
+    if (!staUp) { r->send(409, "application/json", "{\"error\":\"not connected to home WiFi\"}"); return; }
+    bool whole = r->hasParam("whole", true) && r->getParam("whole", true)->value() == "1";
+    v4LightScan(whole);
+    sendJson(r, v4LightsJson());
+  });
+  server.on("/api/lights/ip", HTTP_POST, [](AsyncWebServerRequest *r) {
+    IPAddress ip;
+    String s = r->hasParam("ip", true) ? r->getParam("ip", true)->value() : "";
+    if (!ip.fromString(s)) { r->send(400, "application/json", "{\"error\":\"bad ip\"}"); return; }
+    v4LightManual(ip);
+    sendJson(r, "{\"ok\":true}");
+  });
+  server.on("/api/lights/tuya", HTTP_POST, [](AsyncWebServerRequest *r) {
+    String dev = r->hasParam("dev", true) ? r->getParam("dev", true)->value() : "";
+    String ip = r->hasParam("ip", true) ? r->getParam("ip", true)->value() : "";
+    String key = r->hasParam("key", true) ? r->getParam("key", true)->value() : "";
+    int ver = r->hasParam("ver", true) ? r->getParam("ver", true)->value().toInt() : 33;
+    bool clear = r->hasParam("clear", true) && r->getParam("clear", true)->value() == "1";
+    if (!v4TuyaKeySet(dev.c_str(), ip.c_str(), key.c_str(), ver, clear)) {
+      r->send(400, "application/json", "{\"error\":\"need a LAN ip\"}"); return;
+    }
+    sendJson(r, "{\"ok\":true}");
+  });
   server.on("/api/lights/beta", HTTP_POST, [](AsyncWebServerRequest *r) {
     bool on = r->hasParam("v", true) && r->getParam("v", true)->value() == "1";
     v4SetBeta(on);
